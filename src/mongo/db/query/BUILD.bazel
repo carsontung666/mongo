@@ -919,6 +919,18 @@ mongo_cc_benchmark(
 )
 
 mongo_cc_benchmark(
+    name = "count_query_bm",
+    srcs = [
+        "count_query_bm.cpp",
+    ],
+    tags = ["query_bm"],
+    deps = [
+        "query_bm_fixture",
+        "//src/mongo/rpc:get_status_from_command_result",
+    ],
+)
+
+mongo_cc_benchmark(
     name = "complex_query_bm",
     srcs = [
         "complex_query_bm.cpp",

@@ -5,6 +5,7 @@ selector:
   root: bazel-bin/install/install-query_bm_test_list.txt
   include_files:
     # The trailing asterisk is for handling the .exe extension on Windows.
+    - bazel-bin/**/count_query_bm*
     - bazel-bin/**/complex_query_bm*
     - bazel-bin/**/query_bm*
     - bazel-bin/**/point_query_bm*

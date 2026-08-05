@@ -27,6 +27,9 @@ public:
     void runBenchmark(BSONObj filter, BSONObj projection, benchmark::State& state);
 
 protected:
+    BSONObj runCommand(BSONObj command);
+
+    void runCommandBenchmark(BSONObj command, benchmark::State& state);
     const std::vector<BSONObj>& docs() const {
         return _docs;
     }

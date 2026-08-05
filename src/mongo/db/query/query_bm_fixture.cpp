@@ -4,11 +4,32 @@
 #include "mongo/db/query/query_bm_fixture.h"
 
 #include "mongo/db/shard_role/shard_role.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/transport/service_entry_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
+namespace {
+
+Message serializeCommand(BSONObj command) {
+    OpMsgRequest request;
+    request.body = std::move(command);
+    return request.serialize();
+}
+
+Message handleCommandRequest(const Message& request) {
+    Client& client = cc();
+    auto opCtx = client.makeOperationContext();
+    auto response = client.getService()
+                        ->getServiceEntryPoint()
+                        ->handleRequest(opCtx.get(), request, opCtx->fastClockSource().now())
+                        .getNoThrow();
+    iassert(response);
+    return std::move(response.getValue().response);
+}
+
+}  // namespace
 
 const NamespaceString QueryBenchmarkFixture::kNss =
     NamespaceString::createNamespaceString_forTest("test", "coll");
@@ -33,27 +54,29 @@ void QueryBenchmarkFixture::runBenchmark(BSONObj filter,
                                          benchmark::State& state) {
     BSONObj command = BSON("find" << kNss.coll() << "$db" << kNss.db_forTest() << "filter" << filter
                                   << "projection" << projection);
-    OpMsgRequest request;
-    request.body = command;
-    auto msg = request.serialize();
+    runCommandBenchmark(std::move(command), state);
+}
+
+BSONObj QueryBenchmarkFixture::runCommand(BSONObj command) {
+    auto msg = serializeCommand(std::move(command));
+
+    ThreadClient threadClient{getGlobalServiceContext()->getService()};
+    const auto response = handleCommandRequest(msg);
+    return OpMsg::parse(response).body.getOwned();
+}
+
+void QueryBenchmarkFixture::runCommandBenchmark(BSONObj command, benchmark::State& state) {
+    auto msg = serializeCommand(std::move(command));
 
     ThreadClient threadClient{getGlobalServiceContext()->getService()};
     runBenchmarkWithProfiler(
         [&]() {
-            Client& client = cc();
-            auto opCtx = client.makeOperationContext();
-            auto statusWithResponse =
-                client.getService()
-                    ->getServiceEntryPoint()
-                    ->handleRequest(opCtx.get(), msg, opCtx->fastClockSource().now())
-                    .getNoThrow();
-            iassert(statusWithResponse);
+            const auto response = handleCommandRequest(msg);
             LOGV2_DEBUG(9278700,
                         1,
                         "db response",
                         "request"_attr = msg.opMsgDebugString(),
-                        "response"_attr =
-                            statusWithResponse.getValue().response.opMsgDebugString());
+                        "response"_attr = response.opMsgDebugString());
         },
         state);
 }
