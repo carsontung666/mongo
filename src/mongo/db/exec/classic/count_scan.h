@@ -77,8 +77,9 @@ struct CountScanParams {
  * command and some cases of aggregation).
  *
  * Scans an index from a start key to an end key. Creates a WorkingSetMember for each matching index
- * key in RID_AND_OBJ state. It has a null record id and an empty object with a null snapshot id
- * rather than real data. Returning real data is unnecessary since all we need is the count.
+ * key in RID_AND_OBJ state. It holds the index entry's record id and an empty object with a null
+ * snapshot id rather than real data. Returning real data is unnecessary since all we need is the
+ * count.
  */
 class CountScan final : public RequiresIndexStage {
 public:
@@ -108,8 +109,18 @@ protected:
     void doRestoreStateRequiresIndex() final;
 
 private:
+    // A direct CountStage parent reads only our StageState, so it turns off materialization. This
+    // is private because WorkingSet::get() does not check for INVALID_ID outside debug builds: any
+    // other consumer that called this would read out of bounds instead of failing an assertion.
+    friend class CountStage;
+    void setDoesNotMaterializeResults() {
+        _materializeResults = false;
+    }
+
     // The WorkingSet we annotate with results.  Not owned by us.
     WorkingSet* _workingSet;
+
+    bool _materializeResults = true;
 
     const BSONObj _keyPattern;
 

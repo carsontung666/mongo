@@ -178,7 +178,9 @@ public:
 
     /**
      * Perform a unit of work on the query.  Ask the stage to produce the next unit of output.
-     * Stage returns StageState::ADVANCED if *out is set to the next unit of output.  Otherwise,
+     * Stage returns StageState::ADVANCED if *out is set to the next unit of output.
+     * A stage whose consumer has told it that its output is ignored may instead set *out to
+     * WorkingSet::INVALID_ID; see CountScan::setDoesNotMaterializeResults().  Otherwise,
      * returns another value of StageState to indicate the stage's status.
      *
      * Throws an exception if an error is encountered while executing the query.
