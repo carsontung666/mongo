@@ -157,6 +157,23 @@ private:
     boost::optional<IndexKeyEntry> initIndexScan();
 
     // The WorkingSet we fill with results.  Not owned by us.
+    // A parent FETCH clears keyData after its consistency check, so nothing above it can read the
+    // key. When such a parent adopts us it says so here, and if this scan also has no bounds
+    // checker, no filter and no key metadata to produce -- the only other readers of the key --
+    // then we keep the cursor's KeyString rather than decoding a BSON key nobody wants.
+    friend class FetchStage;
+    void parentWillNotReadKeys() {
+        _parentWillNotReadKeys = true;
+    }
+
+    bool _parentWillNotReadKeys = false;
+    bool _skipKeyMaterialization = false;
+
+    // Stashes the KeyString from the cursor while the surrounding doWork() logic continues to work
+    // with an IndexKeyEntry whose BSON key is empty.
+    boost::optional<key_string::Value> _lastKeyString;
+    boost::optional<IndexKeyEntry> toIndexKeyEntry(boost::optional<KeyStringEntry> entry);
+
     WorkingSet* const _workingSet;
 
     std::unique_ptr<SortedDataInterface::Cursor> _indexCursor;

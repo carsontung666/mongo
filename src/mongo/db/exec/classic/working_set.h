@@ -9,6 +9,7 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/snapshot.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
@@ -50,6 +51,15 @@ struct IndexKeyDatum {
                   SnapshotId snapshotId)
         : indexKeyPattern(keyPattern), keyData(key), indexId(indexId), snapshotId(snapshotId) {}
 
+    IndexKeyDatum(const BSONObj& keyPattern,
+                  key_string::Value keyString,
+                  WorkingSetRegisteredIndexId indexId,
+                  SnapshotId snapshotId)
+        : indexKeyPattern(keyPattern),
+          keyString(std::move(keyString)),
+          indexId(indexId),
+          snapshotId(snapshotId) {}
+
     /**
      * getFieldDotted produces the field with the provided name based on index keyData. The return
      * object is populated if the element is in a provided index key.  Returns none otherwise.
@@ -76,8 +86,14 @@ struct IndexKeyDatum {
     // This is not owned and points into the IndexDescriptor's data.
     BSONObj indexKeyPattern;
 
-    // This is the BSONObj for the key that we put into the index.  Owned by us.
+    // This is the BSONObj for the key that we put into the index.  Owned by us. Empty when the
+    // scan was told nobody would read it; 'keyString' is then set instead.
     BSONObj keyData;
+
+    // The KeyString the index cursor produced, kept instead of 'keyData' when the only consumer is
+    // the parent FETCH's post-yield consistency check. That check compares KeyStrings, so keeping
+    // this avoids decoding the key to BSON and re-encoding it again.
+    boost::optional<key_string::Value> keyString;
 
     // Associates this index key with an index that has been registered with the WorkingSet. Can be
     // used to recover pointers to catalog objects for this index from the WorkingSet.

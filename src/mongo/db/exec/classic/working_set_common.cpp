@@ -178,6 +178,16 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
                          multikeyMetadataKeys,
                          multikeyPaths,
                          member->recordId);
+            // When the scan kept the cursor's KeyString there is nothing to re-encode: getKeys()
+            // produces the same encoding, and KeyStringSet compares key bytes.
+            if (memberKey.keyString) {
+                if (!keys->count(*memberKey.keyString)) {
+                    // document would no longer be at this position in the index.
+                    return false;
+                }
+                continue;
+            }
+
             key_string::HeapBuilder keyString(iam->getSortedDataInterface()->getKeyStringVersion(),
                                               memberKey.keyData,
                                               iam->getSortedDataInterface()->getOrdering(),

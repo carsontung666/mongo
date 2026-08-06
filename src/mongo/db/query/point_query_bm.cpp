@@ -59,6 +59,26 @@ BENCHMARK_DEFINE_F(PointQueryBenchmark, ArrayFieldPointQuery)
     runBenchmark(BSON("arrayField" << fieldValue), BSONObj{} /*projection*/, state);
 }
 
+// A range over the unique field returning whole documents, i.e. IXSCAN -> FETCH over many keys.
+// This is the shape where per-key scan work dominates, as opposed to the point lookups above.
+BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldRangeScan)
+(benchmark::State& state) {
+    const auto numDocs = static_cast<int64_t>(docs().size());
+    runBenchmark(BSON("uniqueField" << BSON("$gte" << 0 << "$lt" << numDocs)),
+                 BSONObj{} /*projection*/,
+                 state);
+}
+
+// The same range, but covered by the index, so the key BSON is consumed by the projection rather
+// than discarded. This is the control for a change that skips materializing unread keys.
+BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldRangeScanCovered)
+(benchmark::State& state) {
+    const auto numDocs = static_cast<int64_t>(docs().size());
+    runBenchmark(BSON("uniqueField" << BSON("$gte" << 0 << "$lt" << numDocs)),
+                 BSON("_id" << 0 << "uniqueField" << 1),
+                 state);
+}
+
 BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldPointQueryWithCoveredProjection)
 (benchmark::State& state) {
     int64_t fieldValue = docs().size() / 2;
@@ -114,6 +134,11 @@ static void configureBenchmarks(benchmark::internal::Benchmark* bm) {
     bm->ThreadRange(1, kMaxThreads)->Args({10, 1024});
 }
 
+static void configureRangeScanBenchmarks(benchmark::internal::Benchmark* bm) {
+    // Enough keys that per-key scan work, rather than command overhead, dominates.
+    bm->ThreadRange(1, 1)->Args({1'000, 256})->Args({10'000, 256})->Args({100'000, 256});
+}
+
 static void configureProjectionBenchmarks(benchmark::internal::Benchmark* bm) {
     // Varying document size allows us to measure the effect of covering the projection with an
     // index.
@@ -124,6 +149,9 @@ BENCHMARK_REGISTER_F(PointQueryBenchmark, IdPointQuery)->Apply(configureBenchmar
 BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldPointQuery)->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, NonUniqueFieldPointQuery)->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, ArrayFieldPointQuery)->Apply(configureBenchmarks);
+BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldRangeScan)->Apply(configureRangeScanBenchmarks);
+BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldRangeScanCovered)
+    ->Apply(configureRangeScanBenchmarks);
 
 BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldPointQueryWithCoveredProjection)
     ->Apply(configureProjectionBenchmarks);

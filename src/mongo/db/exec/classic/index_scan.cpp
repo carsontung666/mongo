@@ -106,6 +106,11 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
                 _bounds, &_startKey, &_startKeyInclusive, &_endKey, &_endKeyInclusive)) {
             _indexCursor->setEndPosition(_endKey, _endKeyInclusive);
 
+            // Only here is the bounds shape settled, so this is where the decision can be made:
+            // there is no checker on this path, and _filter and _addKeyMetadata are the sole
+            // remaining readers of the key inside this stage.
+            _skipKeyMaterialization = _parentWillNotReadKeys && !_filter && !_addKeyMetadata;
+
             key_string::Builder builder(
                 indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion());
             auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
@@ -114,6 +119,9 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
                 _forward,
                 _startKeyInclusive,
                 builder);
+            if (_skipKeyMaterialization) {
+                return toIndexKeyEntry(_indexCursor->seekForKeyString(ru, keyStringForSeek));
+            }
             return _indexCursor->seek(ru, keyStringForSeek);
         } else {
             _checker.reset(new IndexBoundsChecker(&_bounds, _keyPattern, _direction));
@@ -130,6 +138,16 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     }
 }
 
+boost::optional<IndexKeyEntry> IndexScan::toIndexKeyEntry(
+    boost::optional<KeyStringEntry> entry) {
+    if (!entry) {
+        _lastKeyString = boost::none;
+        return boost::none;
+    }
+    _lastKeyString = std::move(entry->keyString);
+    return IndexKeyEntry(BSONObj(), std::move(entry->loc));
+}
+
 PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     // Get the next kv pair from the index, if any.
     boost::optional<IndexKeyEntry> kv;
@@ -144,7 +162,8 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
                     kv = initIndexScan();
                     break;
                 case GETTING_NEXT:
-                    kv = _indexCursor->next(ru);
+                    kv = _skipKeyMaterialization ? toIndexKeyEntry(_indexCursor->nextKeyString(ru))
+                                                 : _indexCursor->next(ru);
                     break;
                 case NEED_SEEK: {
                     ++_specificStats.seeks;
@@ -172,7 +191,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
 
     if (kv) {
         // In debug mode, check that the cursor isn't lying to us.
-        if (kDebugBuild && !_startKey.isEmpty()) {
+        if (kDebugBuild && !_skipKeyMaterialization && !_startKey.isEmpty()) {
             int cmp = kv->key.woCompare(_startKey,
                                         Ordering::make(_keyPattern),
                                         /*compareFieldNames*/ false);
@@ -181,7 +200,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
             dassert(_forward ? cmp >= 0 : cmp <= 0);
         }
 
-        if (kDebugBuild && !_endKey.isEmpty()) {
+        if (kDebugBuild && !_skipKeyMaterialization && !_endKey.isEmpty()) {
             int cmp = kv->key.woCompare(_endKey,
                                         Ordering::make(_keyPattern),
                                         /*compareFieldNames*/ false);
@@ -270,11 +289,15 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
     member->recordId = std::move(kv->loc);
-    member->keyData.push_back(
-        IndexKeyDatum(_keyPattern,
-                      kv->key,
-                      workingSetIndexId(),
-                      shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId()));
+    const auto snapshotId = shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId();
+    if (_skipKeyMaterialization) {
+        member->keyData.push_back(
+            IndexKeyDatum(_keyPattern, std::move(*_lastKeyString), workingSetIndexId(), snapshotId));
+        _lastKeyString = boost::none;
+    } else {
+        member->keyData.push_back(
+            IndexKeyDatum(_keyPattern, kv->key, workingSetIndexId(), snapshotId));
+    }
     _workingSet->transitionToRecordIdAndIdx(id);
 
     if (_addKeyMetadata) {

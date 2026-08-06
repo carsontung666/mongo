@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/exec/classic/fetch.h"
+#include "mongo/base/checked_cast.h"
+#include "mongo/db/exec/classic/index_scan.h"
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/classic/filter.h"
@@ -33,6 +35,14 @@ FetchStage::FetchStage(ExpressionContext* expCtx,
       _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
       _idRetrying(WorkingSet::INVALID_ID) {
     _children.emplace_back(std::move(child));
+
+    // We clear keyData once our consistency check is done, so no stage above us can read it. Tell a
+    // direct IXSCAN child that, so it can keep the cursor's KeyString instead of decoding a BSON
+    // key that only that check would look at. IndexScan is the only stage reporting STAGE_IXSCAN,
+    // and it applies this only when it has no bounds checker, filter or key metadata of its own.
+    if (_children.back()->stageType() == STAGE_IXSCAN) {
+        checked_cast<IndexScan*>(_children.back().get())->parentWillNotReadKeys();
+    }
 }
 
 FetchStage::~FetchStage() {}
