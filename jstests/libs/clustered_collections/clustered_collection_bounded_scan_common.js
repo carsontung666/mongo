@@ -109,12 +109,15 @@ export const testClusteredCollectionBoundedScan = function (coll, clusterKey, ch
 
         const filter = {[clusterKeyFieldName]: 5};
         const comment = "testEq-" + op;
-        // Use 'batchSize' to avoid selecting "EXPRESS" instead of "CLUSTERED_IXSCAN".
-        assert.eq(coll.find(filter).batchSize(20).comment(comment).itcount(), 1);
+        // Hint a natural scan to avoid selecting "EXPRESS" instead of "CLUSTERED_IXSCAN". A hint
+        // makes the query ineligible for express, and on a clustered collection the bounded
+        // collection scan is still derived from the cluster-key predicate, so this reports the same
+        // CLUSTERED_IXSCAN with the same minRecord/maxRecord and the same docsExamined.
+        assert.eq(coll.find(filter).hint({$natural: 1}).comment(comment).itcount(), 1);
         assertLogAndProfileHaveCorrectStage(coll.getDB(), comment, "CLUSTERED_IXSCAN");
         const expl = assert.commandWorked(
             coll.getDB().runCommand({
-                explain: {find: coll.getName(), filter: filter, batchSize: 20},
+                explain: {find: coll.getName(), filter: filter, hint: {$natural: 1}},
                 verbosity: "executionStats",
             }),
         );

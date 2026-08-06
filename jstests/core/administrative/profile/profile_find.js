@@ -47,8 +47,10 @@ for (i = 0; i < 3; ++i) {
 }
 assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "fr"}}));
 
-// Use batchSize to avoid express path.
-assert.eq(coll.find({a: 1}).collation({locale: "fr"}).limit(1).batchSize(2).itcount(), 1);
+// Hint the index to avoid the express path. A hint makes a query ineligible for express (see
+// isIdHackEligibleQueryWithoutCollator and isEqualityExpressEligibleQuery, both of which require an
+// empty hint) while leaving the plan this block asserts on unchanged: LIMIT -> FETCH -> IXSCAN.
+assert.eq(coll.find({a: 1}).collation({locale: "fr"}).limit(1).hint({a: 1}).itcount(), 1);
 
 let profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
