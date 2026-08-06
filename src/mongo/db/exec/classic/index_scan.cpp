@@ -282,7 +282,12 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
                 _memoryTracker.withinMemoryLimit(opCtx()));
     }
 
-    if (!kv->key.isOwned())
+    // When the key was not materialized this is a default-constructed BSONObj, which is not owned,
+    // so getOwned() would allocate and copy a five-byte empty object once per key for something no
+    // one reads. Nothing below looks at it on that path: 'keyData' takes the KeyString instead,
+    // Filter::passes() returns true without inspecting the key when there is no filter, and
+    // _addKeyMetadata is required to be false for the path to be taken at all.
+    if (!_skipKeyMaterialization && !kv->key.isOwned())
         kv->key = kv->key.getOwned();
 
     // We found something to return, so fill out the WSM.
