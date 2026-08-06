@@ -351,6 +351,40 @@ void InListData::makeBSONOwned() {
     tassert(status);
 }
 
+void InListData::shareBSONOwnershipWith(const BSONObj& owner) {
+    // Sharing is an optimization, so a list that someone else already holds is simply left alone
+    // rather than cloned out from under them.
+    if (isShared() || !_elementsInitialized || !_arr || _arr->isOwned() || !owner.isOwned()) {
+        return;
+    }
+
+    // Pinning 'owner' is only sound if 'owner' is itself a view into the buffer it owns.
+    // BSONObj::shareOwnershipWith() permits an object to own a buffer it does not point into, and
+    // every caller here satisfies the stronger property, so assert it rather than assume it.
+    dassert(owner.objdata() >= owner.sharedBuffer().get());
+
+    // Our bytes must really live inside 'owner'; otherwise we would pin the wrong buffer and leave
+    // our elements dangling. std::less is the portable spelling for comparing pointers that the
+    // compiler cannot see are related.
+    const char* const ownerBegin = owner.objdata();
+    const char* const ownerEnd = ownerBegin + owner.objsize();
+    if (std::less<const char*>{}(_arr->objdata(), ownerBegin) ||
+        std::less<const char*>{}(ownerEnd, _arr->objdata() + _arr->objsize())) {
+        return;
+    }
+
+    // Sharing swaps a copy proportional to our array for a pin proportional to 'owner', and this
+    // object can outlive the query via SBE's pinned plan cache, so decline when 'owner' is much the
+    // larger of the two.
+    if (owner.objsize() - _arr->objsize() > kMaxSharedOwnershipSlackBytes) {
+        return;
+    }
+
+    // The bytes do not move, so '_originalElements', '_sortedElements' and
+    // '_firstOfEachTypeElements' all stay valid and need no remapping.
+    _arr->shareOwnershipWith(owner);
+}
+
 namespace {
 // Updates each BSONElement in container 'elements' to refer to backing buffer 'newBuffer' given
 // that each element refers to backing buffer 'previousBuffer'.

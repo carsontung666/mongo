@@ -1060,4 +1060,78 @@ TEST(MatchExpressionParserTest, BitTestMatchExpressionInvalidArrayValue) {
             expCtx)
             .getStatus());
 }
+TEST(MatchExpressionParserLeafTest, InListSharesOwnershipOfAnOwnedFilter) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    // A filter that arrives on the wire is owned; its $in array is a view into it, so without
+    // sharing, IndexBoundsBuilder must deep-copy the list every time it builds bounds.
+    BSONObj filter = BSON("a" << BSON("$in" << BSON_ARRAY(1 << 2 << 3))).getOwned();
+    ASSERT_TRUE(filter.isOwned());
+
+    auto result = MatchExpressionParser::parse(filter, expCtx);
+    ASSERT_OK(result.getStatus());
+    MatchExpression* root = result.getValue().get();
+    auto* in = checked_cast<InMatchExpression*>(
+        root->matchType() == MatchExpression::MATCH_IN ? root : root->getChild(0));
+    ASSERT_TRUE(in->isBSONOwned());
+    // Sharing rather than copying: the storage must be the same bytes, not a duplicate.
+    ASSERT_EQ(in->getOwnedBSONStorage().objdata(),
+              filter.firstElement().Obj().firstElement().Obj().objdata());
+}
+
+TEST(MatchExpressionParserLeafTest, InListDoesNotShareOwnershipOfAnUnownedFilter) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    BSONObj owner = BSON("a" << BSON("$in" << BSON_ARRAY(1 << 2 << 3)));
+    BSONObj unowned(owner.objdata());
+    ASSERT_FALSE(unowned.isOwned());
+
+    auto result = MatchExpressionParser::parse(unowned, expCtx);
+    ASSERT_OK(result.getStatus());
+    MatchExpression* root = result.getValue().get();
+    auto* in = checked_cast<InMatchExpression*>(
+        root->matchType() == MatchExpression::MATCH_IN ? root : root->getChild(0));
+    ASSERT_FALSE(in->isBSONOwned());
+}
+
+TEST(MatchExpressionParserLeafTest, InListSurvivesTheFilterGoingOutOfScope) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    // The point of sharing rather than copying is that the elements stay valid once the caller's
+    // BSONObj is gone. If the containment guard ever let the wrong buffer be pinned, this is what
+    // would trip under ASAN.
+    StatusWithMatchExpression result = [&] {
+        BSONObj filter = BSON("a" << BSON("$in" << BSON_ARRAY(1 << 2 << 3))).getOwned();
+        return MatchExpressionParser::parse(filter, expCtx);
+    }();
+    ASSERT_OK(result.getStatus());
+
+    MatchExpression* root = result.getValue().get();
+    auto* in = checked_cast<InMatchExpression*>(
+        root->matchType() == MatchExpression::MATCH_IN ? root : root->getChild(0));
+    ASSERT_TRUE(in->isBSONOwned());
+    ASSERT_EQ(in->getEqualities().size(), 3U);
+    ASSERT_EQ(in->getEqualities()[2].numberInt(), 3);
+}
+
+TEST(MatchExpressionParserLeafTest, InListDoesNotShareOwnershipOfAMuchLargerFilter) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    // Sharing would pin the whole filter for as long as the list lives, and an InListData can
+    // outlive its query via SBE's pinned plan cache. A short list inside a large filter must
+    // therefore fall back to copying.
+    BSONObj filter =
+        BSON("a" << BSON("$in" << BSON_ARRAY(1 << 2 << 3)) << "b" << std::string(4096, 'x'))
+            .getOwned();
+    ASSERT_GT(filter.objsize(), InListData::kMaxSharedOwnershipSlackBytes);
+
+    auto result = MatchExpressionParser::parse(filter, expCtx);
+    ASSERT_OK(result.getStatus());
+    auto* in = checked_cast<InMatchExpression*>(result.getValue()->getChild(0));
+    ASSERT_FALSE(in->isBSONOwned());
+    // Still intact, just on the copying path.
+    ASSERT_EQ(in->getEqualities().size(), 3U);
+    ASSERT_EQ(in->getEqualities()[2].numberInt(), 3);
+}
+
 }  // namespace mongo

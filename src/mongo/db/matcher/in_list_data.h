@@ -248,6 +248,27 @@ public:
 
     void makeBSONOwned();
 
+    /**
+     * Take shared ownership of 'owner' instead of copying, when our array is a view into it. This
+     * makes isBSONOwned() true for the cost of a refcount: the elements already point into 'owner',
+     * so unlike makeBSONOwned() there is nothing to copy and nothing to remap.
+     *
+     * 'owner' must be owned, its own bytes must live in its shared buffer, and our array must lie
+     * within it. This is best effort: if any of that does not hold, or if sharing would retain
+     * substantially more memory than copying, we decline and leave the caller on the copying path.
+     * Declining is always safe.
+     *
+     * The size condition matters because an InListData can outlive the query that produced it --
+     * SBE stores it in a pinned plan cache entry whose budget estimator does not account for it --
+     * so a small list inside a large filter must not pin the filter.
+     */
+    void shareBSONOwnershipWith(const BSONObj& owner);
+
+    // How much larger than our own array 'owner' may be before shareBSONOwnershipWith() declines.
+    // Sharing trades a copy proportional to the array for a pin proportional to the owner, so it is
+    // only worth taking when the difference is small.
+    static constexpr int kMaxSharedOwnershipSlackBytes = 1024;
+
     MONGO_COMPILER_ALWAYS_INLINE
     bool isShared() const {
         return _shared.load();

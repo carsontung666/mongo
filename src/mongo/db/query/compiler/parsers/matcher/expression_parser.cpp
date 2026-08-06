@@ -2182,6 +2182,28 @@ Status parseSub(boost::optional<std::string_view> name,
 
 }  // namespace
 
+namespace {
+/**
+ * Give every $in list in 'root' shared ownership of 'filter', where its elements already live.
+ *
+ * Without this, IndexBoundsBuilder has to clone the whole InMatchExpression and deep-copy its list
+ * every time it builds bounds, because BSONElement::Obj() yields an unowned view and so
+ * InListData::isBSONOwned() is never true for a list parsed out of a command. The filter is owned
+ * for the lifetime of the CanonicalQuery, so sharing it costs a refcount instead of an O(n) copy.
+ *
+ * InListData::shareBSONOwnershipWith() verifies containment and declines if it does not hold, so a
+ * list assembled from somewhere other than 'filter' is left alone.
+ */
+void shareFilterOwnershipWithInLists(MatchExpression* root, const BSONObj& filter) {
+    if (root->matchType() == MatchExpression::MATCH_IN) {
+        static_cast<InMatchExpression*>(root)->shareBSONOwnershipWith(filter);
+    }
+    for (size_t i = 0; i < root->numChildren(); ++i) {
+        shareFilterOwnershipWithInLists(root->getChild(i), filter);
+    }
+}
+}  // namespace
+
 StatusWithMatchExpression MatchExpressionParser::parse(
     const BSONObj& obj,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -2190,7 +2212,12 @@ StatusWithMatchExpression MatchExpressionParser::parse(
     invariant(expCtx.get());
     const DocumentParseLevel currentLevelCall = DocumentParseLevel::kPredicateTopLevel;
     try {
-        return ::mongo::parse(obj, expCtx, &extensionsCallback, allowedFeatures, currentLevelCall);
+        auto expr =
+            ::mongo::parse(obj, expCtx, &extensionsCallback, allowedFeatures, currentLevelCall);
+        if (expr.isOK() && obj.isOwned()) {
+            shareFilterOwnershipWithInLists(expr.getValue().get(), obj);
+        }
+        return expr;
     } catch (const DBException& ex) {
         return {ex.toStatus()};
     }
