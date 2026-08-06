@@ -754,6 +754,14 @@ public:
         _equalities->makeBSONOwned();
     }
 
+    /**
+     * Take shared ownership of 'owner' rather than copying, when our list is a view into it. See
+     * InListData::shareBSONOwnershipWith().
+     */
+    void shareBSONOwnershipWith(const BSONObj& owner) {
+        _equalities->shareBSONOwnershipWith(owner);
+    }
+
     const std::vector<std::unique_ptr<RegexMatchExpression>>& getRegexes() const {
         return _regexes;
     }

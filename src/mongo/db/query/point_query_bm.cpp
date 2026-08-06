@@ -47,6 +47,19 @@ BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldPointQuery)
     runBenchmark(BSON("uniqueField" << fieldValue), BSONObj{} /*projection*/, state);
 }
 
+// An $in over the unique field, with the list length as the third argument. Index bounds are built
+// once per execution because such a query is single-solution and so is never plan-cached, which
+// makes any per-build cost that scales with the list length visible here.
+BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldInListQuery)
+(benchmark::State& state) {
+    const auto listLength = state.range(2);
+    BSONArrayBuilder bab;
+    for (int64_t i = 0; i < listLength; ++i) {
+        bab.append(i);
+    }
+    runBenchmark(BSON("uniqueField" << BSON("$in" << bab.arr())), BSONObj{} /*projection*/, state);
+}
+
 BENCHMARK_DEFINE_F(PointQueryBenchmark, NonUniqueFieldPointQuery)
 (benchmark::State& state) {
     int64_t fieldValue = docs().size() / 3;
@@ -114,6 +127,11 @@ static void configureBenchmarks(benchmark::internal::Benchmark* bm) {
     bm->ThreadRange(1, kMaxThreads)->Args({10, 1024});
 }
 
+static void configureInListBenchmarks(benchmark::internal::Benchmark* bm) {
+    // The document count is irrelevant here; the list length is the variable of interest.
+    bm->ThreadRange(1, 1)->Args({10, 1024, 10})->Args({10, 1024, 100})->Args({10, 1024, 1000});
+}
+
 static void configureProjectionBenchmarks(benchmark::internal::Benchmark* bm) {
     // Varying document size allows us to measure the effect of covering the projection with an
     // index.
@@ -122,6 +140,7 @@ static void configureProjectionBenchmarks(benchmark::internal::Benchmark* bm) {
 
 BENCHMARK_REGISTER_F(PointQueryBenchmark, IdPointQuery)->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldPointQuery)->Apply(configureBenchmarks);
+BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldInListQuery)->Apply(configureInListBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, NonUniqueFieldPointQuery)->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, ArrayFieldPointQuery)->Apply(configureBenchmarks);
 
