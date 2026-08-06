@@ -392,3 +392,41 @@ runWithParamsAllNodes(
         runExpressTest({coll, filter: {_id: 10}, limit: 1, result: [], usesExpress: true});
     },
 );
+
+// A positive batchSize does not by itself disqualify a query from the express path. An express plan
+// produces at most one document and reports EOF once it has, so the first batch is the whole result
+// whatever the batchSize is, and shouldSaveCursor() declines to register a cursor for an executor
+// that is at EOF. batchSize 0 is different: it asks for an empty first batch and a cursor to fetch
+// from, which would require the express executor to survive in a ClientCursor, so it stays
+// ineligible.
+recreateCollWith(docs);
+assert.commandWorked(coll.createIndex({a: 1}, {unique: true}));
+for (const batchSize of [1, 2, 100]) {
+    const explain = coll.find({a: 0}).limit(1).batchSize(batchSize).explain();
+    assert(isExpress(db, explain), tojson(explain));
+    assert.eq(coll.find({a: 0}).limit(1).batchSize(batchSize).toArray(), [{_id: 0, a: 0, b: 0}]);
+
+    const idExplain = coll.find({_id: 0}).batchSize(batchSize).explain();
+    assert(isExpress(db, idExplain), tojson(idExplain));
+    assert.eq(coll.find({_id: 0}).batchSize(batchSize).toArray(), [{_id: 0, a: 0, b: 0}]);
+}
+// batchSize 0 has to be sent as a raw command: the shell drops .batchSize(0) instead of putting it
+// on the wire, so going through the cursor helper would not exercise the server behaviour at all.
+for (const filter of [{a: 0}, {_id: 0}]) {
+    const explain = assert.commandWorked(db.runCommand({
+        explain: {find: coll.getName(), filter: filter, limit: 1, batchSize: 0},
+        verbosity: "queryPlanner",
+    }));
+    assert(!isExpress(db, explain), tojson(explain));
+
+    // And it still means what it always meant: an empty first batch and a cursor to fetch from.
+    const reply = assert.commandWorked(
+        db.runCommand({find: coll.getName(), filter: filter, limit: 1, batchSize: 0}));
+    assert.eq(reply.cursor.firstBatch, [], tojson(reply));
+    assert.neq(reply.cursor.id, 0, tojson(reply));
+    assert.commandWorked(db.runCommand({killCursors: coll.getName(), cursors: [reply.cursor.id]}));
+}
+
+// A hint keeps a query off the express path whatever its batchSize, which is what
+// profile_find.js and clustered_collection_bounded_scan_common.js rely on.
+assert(!isExpress(db, coll.find({a: 0}).limit(1).batchSize(2).hint({a: 1}).explain()));

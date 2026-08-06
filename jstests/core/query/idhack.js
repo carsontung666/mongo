@@ -92,8 +92,18 @@ if (hasExpress) {
     assert(!isExpress(db, winningPlan), winningPlan);
     assert(isIdhackOrExpress(db, winningPlan), winningPlan);
 
-    // Express is not supported with batchSize, Idhack is.
+    // A positive batchSize does not disqualify express: an express plan returns at most one
+    // document and is exhausted once it has, so the first batch is the whole result either way.
     explain = t.find({_id: 1}).batchSize(10).explain();
+    winningPlan = getWinningPlanFromExplain(explain);
+    assert(isExpress(db, winningPlan), winningPlan);
+    assert(isIdhackOrExpress(db, winningPlan), winningPlan);
+
+    // batchSize 0 does disqualify it, because it asks for an empty first batch and a cursor to
+    // fetch from. It has to be sent as a raw command: the shell drops .batchSize(0) rather than
+    // putting it on the wire.
+    explain = assert.commandWorked(db.runCommand(
+        {explain: {find: t.getName(), filter: {_id: 1}, batchSize: 0}, verbosity: "queryPlanner"}));
     winningPlan = getWinningPlanFromExplain(explain);
     assert(!isExpress(db, winningPlan), winningPlan);
     assert(isIdhackOrExpress(db, winningPlan), winningPlan);

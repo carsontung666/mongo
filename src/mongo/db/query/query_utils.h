@@ -117,7 +117,15 @@ inline ExpressEligibility isExpressEligible(OperationContext* opCtx,
 
     const auto& findCommandReq = cq.getFindCommandRequest();
 
-    if (!coll || findCommandReq.getReturnKey() || findCommandReq.getBatchSize() ||
+    // An express plan produces at most one document and reports EOF once it has, so a positive
+    // batchSize cannot change what the query returns: the first batch is the whole result either
+    // way, and shouldSaveCursor() already declines to register a cursor for an executor that is at
+    // EOF. A batchSize of 0 is different -- it asks for an empty first batch and a cursor to fetch
+    // from, which would require the express executor to survive in a ClientCursor -- so it stays
+    // ineligible.
+    const bool wantsEmptyFirstBatch = findCommandReq.getBatchSize().value_or(1) == 0;
+
+    if (!coll || findCommandReq.getReturnKey() || wantsEmptyFirstBatch ||
         (cq.getProj() != nullptr && !cq.getProj()->isSimple())) {
         return ExpressEligibility::Ineligible;
     }
