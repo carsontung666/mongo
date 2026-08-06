@@ -77,8 +77,13 @@ struct CountScanParams {
  * command and some cases of aggregation).
  *
  * Scans an index from a start key to an end key. Creates a WorkingSetMember for each matching index
- * key in RID_AND_OBJ state. It has a null record id and an empty object with a null snapshot id
- * rather than real data. Returning real data is unnecessary since all we need is the count.
+ * key in RID_AND_OBJ state. It holds the index entry's record id and an empty object with a null
+ * snapshot id rather than real data. Returning real data is unnecessary since all we need is the
+ * count.
+ *
+ * The exception is a direct CountStage parent, which never reads that member and so disables
+ * materialization when it adopts us. doWork() then returns ADVANCED with WorkingSet::INVALID_ID and
+ * builds nothing.
  */
 class CountScan final : public RequiresIndexStage {
 public:
@@ -108,12 +113,36 @@ protected:
     void doRestoreStateRequiresIndex() final;
 
 private:
+    // Private because WorkingSet::get() does not check for INVALID_ID outside debug builds, so any
+    // consumer other than CountStage that called this would read out of bounds in a release build
+    // instead of failing an assertion.
+    friend class CountStage;
+    void disableResultMaterialization() {
+        // Two of the four places that construct a CountStage wrap an already-built rejected plan
+        // root when explaining a count -- ClassicPlannerInterface::makeExecutor() and
+        // buildRejectedExecutableTreesForExplain(). A rejected plan may have been worked during
+        // multiplanning and may hold live WorkingSetIDs, so opting it out is not safe. Today a
+        // COUNT_SCAN solution is never a rejected plan, because QueryPlanner::plan returns it as
+        // the single solution; SERVER-118659 proposes to bring count scans under cost-based
+        // ranking, which would change that. Decline rather than assert, so that landing it costs
+        // this optimization instead of a user's explain. dassert catches the change in testing.
+        if (_commonStats.works != 0) {
+            dassert(false, "CountStage adopted a CountScan that had already been worked");
+            return;
+        }
+        _materializeResults = false;
+    }
+
     // The WorkingSet we annotate with results.  Not owned by us.
     WorkingSet* _workingSet;
 
     const BSONObj _keyPattern;
 
     const bool _shouldDedup;
+
+    // When false, doWork() returns ADVANCED with WorkingSet::INVALID_ID rather than building a
+    // member. Only a direct CountStage parent may clear this.
+    bool _materializeResults = true;
 
     const BSONObj _startKey;
     const bool _startKeyInclusive = true;

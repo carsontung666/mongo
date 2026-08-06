@@ -5,6 +5,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/classic/count.h"
 #include "mongo/db/exec/classic/count_scan.h"
 #include "mongo/db/exec/classic/plan_stage.h"
 #include "mongo/db/exec/classic/working_set.h"
@@ -19,10 +20,13 @@
 #include "mongo/db/shard_role/shard_catalog/database.h"
 #include "mongo/db/shard_role/shard_catalog/index_catalog.h"
 #include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/storage/record_store_write_conflict_fail_points.h"
 #include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/fail_point.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -657,6 +661,122 @@ public:
     }
 };
 
+/**
+ * A standalone CountScan materializes its result, but the same stage under a direct CountStage
+ * parent does not. Working the child directly is what distinguishes the two: CountStage::doWork
+ * sets *out to INVALID_ID unconditionally, so observing the child through the parent would assert
+ * nothing about materialization.
+ */
+class QueryStageCountScanMaterializationContract : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        insert(BSON("a" << 1));
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+        auto makeParams = [&] {
+            auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+            params.startKey = BSON("" << 1);
+            params.endKey = BSON("" << 1);
+            return params;
+        };
+
+        // Standalone: the public RID_AND_OBJ contract is preserved.
+        {
+            WorkingSet ws;
+            CountScan standalone(_expCtx.get(), coll, makeParams(), &ws);
+            WorkingSetID wsid = WorkingSet::INVALID_ID;
+
+            ASSERT_EQUALS(PlanStage::ADVANCED, standalone.work(&wsid));
+            ASSERT_TRUE(WorkingSet::INVALID_ID != wsid);
+            const auto* member = ws.get(wsid);
+            ASSERT_EQUALS(WorkingSetMember::RID_AND_OBJ, member->getState());
+            ASSERT_TRUE(member->hasRecordId());
+            ASSERT_TRUE(member->hasObj());
+            ws.free(wsid);
+        }
+
+        // Under a direct CountStage: no member is produced. Worked through the child so that the
+        // parent's own unconditional INVALID_ID cannot mask the result.
+        {
+            WorkingSet ws;
+            CountStage countStage(
+                _expCtx.get(), 0, 0, &ws, new CountScan(_expCtx.get(), coll, makeParams(), &ws));
+            auto* child = countStage.getChildren().front().get();
+            WorkingSetID wsid = WorkingSet::INVALID_ID;
+
+            ASSERT_EQUALS(PlanStage::ADVANCED, child->work(&wsid));
+            ASSERT_TRUE(WorkingSet::INVALID_ID == wsid);
+        }
+    }
+};
+
+/**
+ * Under a direct CountStage, deduplication, write-conflict yielding, save/restore, skip and limit
+ * are all unchanged: the duplicate multikey key is counted once, and the child's CommonStats match
+ * what a materializing scan reports. Every assertion here is derived from StageState, so this
+ * passes both with and without the materialization change. That is the point: it pins the
+ * behaviour the change must not alter.
+ */
+class QueryStageCountScanDirectCountStageSemantics : public CountBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns().ns_forTest());
+
+        insert(BSON("a" << BSON_ARRAY(1 << 2)));
+        insert(BSON("a" << BSON_ARRAY(3 << 4)));
+        addIndex(BSON("a" << 1));
+
+        const auto coll = ctx.getCollection();
+        auto params = makeCountScanParams(&_opCtx, coll, getIndex(ctx.db(), BSON("a" << 1)));
+        params.startKey = BSON("" << 1);
+        params.endKey = BSON("" << 4);
+
+        WorkingSet ws;
+        // Skip the first counted document and limit to one, so both are exercised.
+        CountStage countStage(
+            _expCtx.get(), 1, 1, &ws, new CountScan(_expCtx.get(), coll, params, &ws));
+        WorkingSetID wsid = WorkingSet::INVALID_ID;
+
+        ASSERT_EQUALS(PlanStage::NEED_TIME, countStage.work(&wsid));
+
+        {
+            auto failPoint = enableWriteConflictForReads(
+                FailPoint::ModeOptions{.mode = FailPoint::Mode::nTimes, .val = 1});
+            ASSERT_EQUALS(PlanStage::NEED_YIELD, countStage.work(&wsid));
+            ASSERT_TRUE(WorkingSet::INVALID_ID == wsid);
+        }
+
+        countStage.saveState();
+        countStage.restoreState(RestoreContext(nullptr));
+
+        while (!countStage.isEOF()) {
+            countStage.work(&wsid);
+        }
+
+        const auto* stats = static_cast<const CountStats*>(countStage.getSpecificStats());
+        ASSERT_EQUALS(1, stats->nSkipped);
+        ASSERT_EQUALS(1, stats->nCounted);
+
+        auto planStats = countStage.getStats();
+        ASSERT_EQUALS(1U, planStats->common.needYield);
+        const auto& childCommon = planStats->children.front()->common;
+        const auto* childStats =
+            static_cast<const CountScanStats*>(planStats->children.front()->specific.get());
+
+        // The limit ends the scan on the third of the four index keys: key one is skipped, key two
+        // belongs to the same document and is deduplicated into a NEED_TIME, key three is counted.
+        // One NEED_TIME against three keys examined and two advances is what shows deduplication
+        // still ran even though no WorkingSetMember was materialized.
+        ASSERT_EQUALS(3U, childStats->keysExamined);
+        ASSERT_EQUALS(2U, childCommon.advanced);
+        ASSERT_EQUALS(1U, childCommon.needTime);
+        ASSERT_EQUALS(1U, childCommon.needYield);
+    }
+};
+
 class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_count_scan") {}
@@ -674,6 +794,8 @@ public:
         add<QueryStageCountScanUnusedKeys>();
         add<QueryStageCountScanMemoryTracking>();
         add<QueryStageCountScanMemoryLimitExceeded>();
+        add<QueryStageCountScanMaterializationContract>();
+        add<QueryStageCountScanDirectCountStageSemantics>();
     }
 };
 

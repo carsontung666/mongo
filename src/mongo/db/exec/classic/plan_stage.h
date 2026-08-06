@@ -181,6 +181,12 @@ public:
      * Stage returns StageState::ADVANCED if *out is set to the next unit of output.  Otherwise,
      * returns another value of StageState to indicate the stage's status.
      *
+     * CountScan is the sole exception: when its parent CountStage has disabled materialization it
+     * returns ADVANCED with *out set to WorkingSet::INVALID_ID.  No other stage may do this.
+     * Consumers dereference *out on ADVANCED without checking it, and WorkingSet::get() validates
+     * its argument only under dassert, so a second stage doing this would be an out-of-bounds read
+     * in release builds.
+     *
      * Throws an exception if an error is encountered while executing the query.
      */
     StageState work(WorkingSetID* out) {

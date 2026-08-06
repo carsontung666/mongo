@@ -3,6 +3,8 @@
 
 #include "mongo/db/exec/classic/count.h"
 
+#include "mongo/base/checked_cast.h"
+#include "mongo/db/exec/classic/count_scan.h"
 #include "mongo/util/assert_util.h"
 
 #include <memory>
@@ -20,6 +22,12 @@ CountStage::CountStage(
     tassert(11051652, "Expecting non-negative limit parameter", _limit >= 0);
     tassert(11051651, "Expecting child stage", child);
     _children.emplace_back(child);
+
+    // We read only our child's StageState, so a direct CountScan need not materialize a result we
+    // would immediately free. CountScan is the only stage reporting STAGE_COUNT_SCAN.
+    if (child->stageType() == STAGE_COUNT_SCAN) {
+        checked_cast<CountScan*>(child)->disableResultMaterialization();
+    }
 }
 
 bool CountStage::isEOF() const {

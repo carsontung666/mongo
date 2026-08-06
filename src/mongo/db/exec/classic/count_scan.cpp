@@ -168,6 +168,13 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
                 _memoryTracker.withinMemoryLimit(opCtx()));
     }
 
+    if (!_materializeResults) {
+        // Deduplication and memory accounting above must still run, so this branch sits below them
+        // and skips only the member our consumer would immediately discard.
+        *out = WorkingSet::INVALID_ID;
+        return PlanStage::ADVANCED;
+    }
+
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
     member->recordId = entry->loc;
