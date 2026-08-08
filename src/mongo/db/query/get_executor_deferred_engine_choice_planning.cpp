@@ -25,11 +25,11 @@
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_params_diagnostic_printer.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/stdx/unordered_map.h"
 
 #include <cstdlib>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -64,17 +64,16 @@ boost::optional<CachedSolutionPair> retrievePlanFromCache(
  * Ceiling probe for caching the plans of hinted, single-solution classic queries.
  *
  * The classic plan cache excludes hinted queries (classic_plan_cache.cpp, shouldCacheQuery) and has
- * no store path for single-solution plans at all -- its only writer runs off a MultiPlanStage.
- * Building both is a large change, so this memo prices the win first. The hit path calls the same
+ * no store path for single-solution plans at all -- its only writer is reached through
+ * MultiPlanStage's pick-best-plan callback, which a hinted query never runs. Building both is a
+ * large change, so this memo prices the win first. The hit path calls the same
  * QueryPlanner::planFromCache() a real cache hit would, and returns through the same
- * SingleSolutionPassthroughPlanner the planning path below returns, so the two arms differ only in
- * whether QueryPlanner::plan() ran.
+ * SingleSolutionPassthroughPlanner the planning path below returns.
  *
  * Deliberately incorrect, and never to be enabled outside an A/B measurement: the memo is
- * process-wide, is keyed on a hash that does not encode the hint (so two hints on one shape
- * collide), is never invalidated by index or collection drops, and never evicts. It also bypasses
- * shouldCacheQuery(), which would trip the dassert in QueryPlanner::planFromCache() on a debug
- * build. Gated by MONGO_PROBE_HINTED_PLAN_MEMO, read once per process.
+ * process-wide, is never invalidated by index or collection drops, and never evicts. It also
+ * bypasses shouldCacheQuery(), which would trip the dassert in QueryPlanner::planFromCache() on a
+ * debug build. Gated by MONGO_PROBE_HINTED_PLAN_MEMO, read once per process.
  */
 bool hintedPlanMemoEnabled() {
     static const bool enabled = [] {
@@ -84,13 +83,41 @@ bool hintedPlanMemoEnabled() {
     return enabled;
 }
 
+/**
+ * Mirrors every exclusion in shouldCacheQuery() except the hint itself.
+ *
+ * That list is not arbitrary and dropping any of it silently returns wrong rows. encodeClassic()
+ * encodes the match expression, sort, projection and collation, and *none* of min, max, tailable or
+ * explain -- which is exactly why shouldCacheQuery() excludes them. Keeping only the hint check
+ * would let find().hint().min().max() be served a plan built without the min/max bounds: planning a
+ * min/max query never sets soln->cacheData, so such a query can only ever read another query's
+ * unbounded entry, never store its own correct one.
+ */
+bool hintedPlanMemoEligible(const CanonicalQuery& cq) {
+    const auto& findCommand = cq.getFindCommandRequest();
+    return !findCommand.getHint().isEmpty() && findCommand.getMin().isEmpty() &&
+        findCommand.getMax().isEmpty() && !findCommand.getTailable() &&
+        !cq.isExplainAndCacheIneligible() &&
+        !cq.getExpCtx()->getQueryKnobConfiguration().getDisablePlanCache() &&
+        !cq.getPrimaryMatchExpression()->isTriviallyFalse();
+}
+
+struct HintedPlanMemoEntry {
+    // The real cache hashes to a bucket and then compares the whole key. Keying on the hash alone
+    // would let two structurally isomorphic shapes over different fields collide, and
+    // tagAccordingToCache() validates only tree topology, not field paths -- so the wrong predicate
+    // would be tagged at the recorded key position and the query would return wrong rows.
+    std::string keyString;
+    std::unique_ptr<SolutionCacheData> cacheData;
+};
+
 std::mutex hintedPlanMemoMutex;
-std::unordered_map<uint32_t, std::unique_ptr<SolutionCacheData>> hintedPlanMemo;
+stdx::unordered_map<uint32_t, HintedPlanMemoEntry> hintedPlanMemo;
 
 std::unique_ptr<QuerySolution> tryHintedPlanMemo(const PlanCacheKey& planCacheKey,
                                                  const CanonicalQuery& cq,
                                                  const QueryPlannerParams& plannerParams) {
-    if (!hintedPlanMemoEnabled() || cq.getFindCommandRequest().getHint().isEmpty()) {
+    if (!hintedPlanMemoEnabled() || !hintedPlanMemoEligible(cq)) {
         return nullptr;
     }
 
@@ -98,10 +125,12 @@ std::unique_ptr<QuerySolution> tryHintedPlanMemo(const PlanCacheKey& planCacheKe
     {
         std::lock_guard<std::mutex> guard(hintedPlanMemoMutex);
         auto entry = hintedPlanMemo.find(planCacheKey.planCacheKeyHash());
-        if (entry == hintedPlanMemo.end()) {
+        if (entry == hintedPlanMemo.end() || entry->second.keyString != planCacheKey.toString()) {
             return nullptr;
         }
-        cacheData = entry->second->clone();
+        // Cloned under the lock on purpose: insert_or_assign would destroy the entry a raw pointer
+        // pointed at.
+        cacheData = entry->second.cacheData->clone();
     }
 
     auto statusWithQs = QueryPlanner::planFromCache(cq, plannerParams, *cacheData);
@@ -118,30 +147,24 @@ std::unique_ptr<QuerySolution> tryHintedPlanMemo(const PlanCacheKey& planCacheKe
 void storeHintedPlanMemo(const PlanCacheKey& planCacheKey,
                          const CanonicalQuery& cq,
                          const QuerySolution& solution) {
-    if (!hintedPlanMemoEnabled()) {
+    if (!hintedPlanMemoEnabled() || !hintedPlanMemoEligible(cq)) {
         return;
     }
 
-    const bool hinted = !cq.getFindCommandRequest().getHint().isEmpty();
-    const bool eligible = solution.isEligibleForPlanCache();
-    const bool hasCacheData = static_cast<bool>(solution.cacheData);
-    if (!hinted || !eligible || !hasCacheData) {
+    if (!solution.isEligibleForPlanCache() || !solution.cacheData) {
         LOGV2_DEBUG(99000001,
                     1,
                     "hinted plan memo: declined to store",
-                    "hinted"_attr = hinted,
-                    "eligibleForPlanCache"_attr = eligible,
-                    "hasCacheData"_attr = hasCacheData);
+                    "eligibleForPlanCache"_attr = solution.isEligibleForPlanCache(),
+                    "hasCacheData"_attr = static_cast<bool>(solution.cacheData));
         return;
     }
 
-    auto cacheData = solution.cacheData->clone();
-    cacheData->indexFilterApplied = solution.indexFilterApplied;
-    cacheData->solutionHash = solution.hash();
-
     {
         std::lock_guard<std::mutex> guard(hintedPlanMemoMutex);
-        hintedPlanMemo.insert_or_assign(planCacheKey.planCacheKeyHash(), std::move(cacheData));
+        hintedPlanMemo.insert_or_assign(
+            planCacheKey.planCacheKeyHash(),
+            HintedPlanMemoEntry{planCacheKey.toString(), solution.cacheData->clone()});
     }
     LOGV2_DEBUG(99000002,
                 1,
