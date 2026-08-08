@@ -64,9 +64,67 @@ inline void maybeUpgradeIdHackFlag(CanonicalQuery& cq, const CollectionPtr& coll
 }
 
 /**
+ * One equality operand of an express-eligible predicate, together with the path it constrains.
+ */
+struct ExpressEquality {
+    std::string_view path;
+    BSONElement data;  // Unowned, borrowed from the match expression.
+};
+
+/**
+ * Decomposes 'me' into the equalities the express executor would have to bind, and returns 'true'
+ * if it is either a single equality or a conjunction of equalities on pairwise-distinct paths, all
+ * generating exact bounds.
+ *
+ * A conjunction is admissible because the express index lookup already builds compound bounds --
+ * it seeks on the leading fields and leaves the remainder fully open -- so binding more than one
+ * leading field needs no new machinery, only the operands in index key order. Which index, if any,
+ * those paths line up with is decided later by getIndexForExpressEquality().
+ *
+ * 'out' is left in an unspecified state when this returns 'false'.
+ */
+inline bool collectExpressEqualities(const MatchExpression* me, std::vector<ExpressEquality>* out) {
+    const auto addOne = [&out](const MatchExpression* node) {
+        if (node->matchType() != MatchExpression::EQ) {
+            return false;
+        }
+        const auto* cmp = static_cast<const ComparisonMatchExpressionBase*>(node);
+        if (!Indexability::isExactBoundsGenerating(cmp->getData())) {
+            return false;
+        }
+        out->push_back(ExpressEquality{node->path(), cmp->getData()});
+        return true;
+    };
+
+    out->clear();
+    if (me->matchType() == MatchExpression::EQ) {
+        return addOne(me);
+    }
+    if (me->matchType() != MatchExpression::AND || me->numChildren() < 2 ||
+        me->numChildren() > static_cast<size_t>(Ordering::kMaxCompoundIndexKeys)) {
+        return false;
+    }
+    for (size_t i = 0; i < me->numChildren(); ++i) {
+        if (!addOne(me->getChild(i))) {
+            return false;
+        }
+    }
+    // Two equalities on one path are not a compound point lookup: they are either redundant or
+    // contradictory, and either way the regular planner should decide.
+    for (size_t i = 1; i < out->size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if ((*out)[i].path == (*out)[j].path) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/**
  * Returns 'true' if 'query' on the given 'collection' can be answered using a special IXSCAN +
- * FETCH plan. Among other restrictions, the query must be a single-field equality generating exact
- * bounds.
+ * FETCH plan. Among other restrictions, the query must be an equality, or a conjunction of
+ * equalities on distinct paths, generating exact bounds.
  */
 inline bool isEqualityExpressEligibleQuery(const CollectionPtr& collection,
                                            const CanonicalQuery& cq) {
@@ -79,15 +137,17 @@ inline bool isEqualityExpressEligibleQuery(const CollectionPtr& collection,
 
     const bool isProjectionEligible = cq.getProj() == nullptr || cq.getProj()->isSimple();
 
-    return
-        // Properties of the find command.
-        isProjectionEligible && !findCommand.getShowRecordId() && findCommand.getHint().isEmpty() &&
-        findCommand.getMin().isEmpty() && findCommand.getMax().isEmpty() &&
-        findCommand.getSort().isEmpty() && !findCommand.getSkip() && !findCommand.getTailable() &&
-        // Properties of the query's match expression.
-        me->matchType() == MatchExpression::EQ &&
-        Indexability::isExactBoundsGenerating(
-            static_cast<ComparisonMatchExpressionBase*>(me)->getData());
+    // Properties of the find command.
+    if (!isProjectionEligible || findCommand.getShowRecordId() ||
+        !findCommand.getHint().isEmpty() || !findCommand.getMin().isEmpty() ||
+        !findCommand.getMax().isEmpty() || !findCommand.getSort().isEmpty() ||
+        findCommand.getSkip() || findCommand.getTailable()) {
+        return false;
+    }
+
+    // Properties of the query's match expression.
+    std::vector<ExpressEquality> equalities;
+    return collectExpressEqualities(me, &equalities);
 }
 
 /**

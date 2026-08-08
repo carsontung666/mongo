@@ -315,7 +315,11 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithMatchingQuery) {
     auto filter = fromjson("{a: 5}");
     CollatorInterface* collator = nullptr;
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        filter.firstElement(), indexEntry->getIdent(), std::string{indexName}, collator, nullptr);
+        std::vector<BSONElement>{filter.firstElement()},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        collator,
+        nullptr);
     iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
 
     // The first call to 'consumeOne()' should provide a document and return 'Exhausted' to indicate
@@ -335,6 +339,77 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithMatchingQuery) {
     ASSERT_BSONOBJ_EQ(iteratorStats.indexKeyPattern(), BSON("a" << 1));
 }
 
+TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCompoundEquality) {
+    std::string_view indexName = "a_1_b_1"sv;
+    auto indexSpec = BSON("v" << 2 << "name" << indexName << "key" << BSON("a" << 1 << "b" << 1));
+    auto collection = createAndPopulateTestCollectionWithIndex(
+        indexSpec, "{_id: 0, a: 5, b: 6}"sv, "{_id: 1, a: 5, b: 7}"sv, "{_id: 2, a: 6, b: 7}"sv);
+    const CollectionPtr& collectionPtr = collection.getCollectionPtr();
+
+    auto indexEntry =
+        collectionPtr->getIndexCatalog()->findIndexByName(operationContext(), indexName);
+
+    IteratorStats iteratorStats;
+    auto filter = fromjson("{a: 5, b: 7}");
+    CollatorInterface* collator = nullptr;
+    // Both key fields are bound, so the seek must land on exactly one key: not {_id: 0}, which
+    // shares only the leading field, and not {_id: 2}, which shares only the trailing one.
+    LookupViaUserIndex<FetchFromCollectionCallback> iterator(
+        std::vector<BSONElement>{filter["a"], filter["b"]},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        collator,
+        nullptr);
+    iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
+
+    auto [result, obj] = iterateAndExpectDocument(operationContext(), iterator);
+    ASSERT(std::holds_alternative<Exhausted>(result));
+    ASSERT_BSONOBJ_EQ(obj, fromjson("{_id: 1, a: 5, b: 7}"));
+
+    result = iterateButExpectNoDocument(operationContext(), iterator);
+    ASSERT(std::holds_alternative<Exhausted>(result));
+
+    ASSERT_EQ(iteratorStats.stageName(), "EXPRESS_IXSCAN");
+    ASSERT_EQ(iteratorStats.numKeysExamined(), 1);
+    ASSERT_EQ(iteratorStats.numDocumentsFetched(), 1);
+    ASSERT_BSONOBJ_EQ(iteratorStats.indexKeyPattern(), BSON("a" << 1 << "b" << 1));
+}
+
+TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCompoundEqualityAndOpenTrailingField) {
+    // Two of three key fields bound, and the unbound one descending, so the open bound appended
+    // for it has to be reversed. Getting that backwards yields an empty range rather than a wrong
+    // document, so the assertion below is what distinguishes the two.
+    std::string_view indexName = "a_1_b_1_c_-1"sv;
+    auto indexSpec =
+        BSON("v" << 2 << "name" << indexName << "key" << BSON("a" << 1 << "b" << 1 << "c" << -1));
+    auto collection = createAndPopulateTestCollectionWithIndex(indexSpec,
+                                                               "{_id: 0, a: 5, b: 6, c: 1}"sv,
+                                                               "{_id: 1, a: 5, b: 7, c: 2}"sv,
+                                                               "{_id: 2, a: 6, b: 7, c: 3}"sv);
+    const CollectionPtr& collectionPtr = collection.getCollectionPtr();
+
+    auto indexEntry =
+        collectionPtr->getIndexCatalog()->findIndexByName(operationContext(), indexName);
+
+    IteratorStats iteratorStats;
+    auto filter = fromjson("{a: 5, b: 7}");
+    CollatorInterface* collator = nullptr;
+    LookupViaUserIndex<FetchFromCollectionCallback> iterator(
+        std::vector<BSONElement>{filter["a"], filter["b"]},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        collator,
+        nullptr);
+    iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
+
+    auto [result, obj] = iterateAndExpectDocument(operationContext(), iterator);
+    ASSERT_BSONOBJ_EQ(obj, fromjson("{_id: 1, a: 5, b: 7, c: 2}"));
+
+    ASSERT_EQ(iteratorStats.stageName(), "EXPRESS_IXSCAN");
+    ASSERT_EQ(iteratorStats.numKeysExamined(), 1);
+    ASSERT_BSONOBJ_EQ(iteratorStats.indexKeyPattern(), BSON("a" << 1 << "b" << 1 << "c" << -1));
+}
+
 TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithMatchingQueryUsingCollator) {
     std::string_view indexName = "a_1"sv;
     auto collationSpec = BSON("locale" << "en_US"
@@ -352,7 +427,11 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithMatchingQueryUsingCollator) {
     IteratorStats iteratorStats;
     auto filter = fromjson("{a: 'iii'}");
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        filter.firstElement(), indexEntry->getIdent(), std::string{indexName}, collator, nullptr);
+        std::vector<BSONElement>{filter.firstElement()},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        collator,
+        nullptr);
     iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
 
     // The first call to 'consumeOne()' should provide a document and return 'Exhausted' to indicate
@@ -386,7 +465,11 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWWithNonMatchingQuery) {
     auto filter = fromjson("{a: 7}");
     CollatorInterface* collator = nullptr;
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        filter.firstElement(), indexEntry->getIdent(), std::string{indexName}, collator, nullptr);
+        std::vector<BSONElement>{filter.firstElement()},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        collator,
+        nullptr);
     iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
 
     // Any number of repeated calls to 'consumeOne()' should return an 'Exhausted' result without
@@ -428,11 +511,12 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCoveredProjection) {
 
     auto projection = parseProjection(operationContext(), fromjson("{_id: 0, a: 1, c: 1}"));
 
-    LookupViaUserIndex<CreateDocumentFromIndexKey> iterator(filter.firstElement(),
-                                                            indexEntry->getIdent(),
-                                                            std::string{indexName},
-                                                            collator,
-                                                            &projection);
+    LookupViaUserIndex<CreateDocumentFromIndexKey> iterator(
+        std::vector<BSONElement>{filter.firstElement()},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        collator,
+        &projection);
     iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
 
     // The first call to 'consumeOne()' should provide a document and return 'Exhausted' to indicate

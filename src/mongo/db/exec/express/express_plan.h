@@ -632,12 +632,17 @@ struct FetchFromCollectionCallback {
 template <class FetchCallback>
 class LookupViaUserIndex {
 public:
-    LookupViaUserIndex(const BSONElement& filterValue,
+    /**
+     * 'filterValues' holds one equality operand per leading field of the index, in index key
+     * order. A single-field equality passes a vector of size one; a conjunction of equalities
+     * fully covering a compound index passes one element per key field.
+     */
+    LookupViaUserIndex(std::vector<BSONElement> filterValues,
                        std::string indexIdent,
                        std::string indexName,
                        const CollatorInterface* collator,
                        const projection_ast::Projection* projection)
-        : _filterValue(filterValue),
+        : _filterValues(std::move(filterValues)),
           _indexIdent(std::move(indexIdent)),
           _indexName(std::move(indexName)),
           _collator(collator),
@@ -670,13 +675,15 @@ public:
             return Exhausted();
         }
 
-        // Build the start and end bounds for the equality by appending a fully-open bound for each
-        // remaining field in the compound index.
+        // Build the start and end bounds by appending each bound equality in index key order, then
+        // a fully-open bound for every remaining field of the compound index.
         BSONObjBuilder startBob, endBob;
-        CollationIndexKey::collationAwareIndexKeyAppend(_filterValue, _collator, &startBob);
-        CollationIndexKey::collationAwareIndexKeyAppend(_filterValue, _collator, &endBob);
+        for (const auto& filterValue : _filterValues) {
+            CollationIndexKey::collationAwareIndexKeyAppend(filterValue, _collator, &startBob);
+            CollationIndexKey::collationAwareIndexKeyAppend(filterValue, _collator, &endBob);
+        }
         auto desc = _indexCatalogEntry->descriptor();
-        for (int i = 1; i < desc->getNumFields(); ++i) {
+        for (int i = static_cast<int>(_filterValues.size()); i < desc->getNumFields(); ++i) {
             if (desc->ordering().get(i) == 1) {
                 startBob.appendMinKey("");
                 endBob.appendMaxKey("");
@@ -787,7 +794,7 @@ private:
         return entry;
     }
 
-    BSONElement _filterValue;  // Unowned BSON.
+    std::vector<BSONElement> _filterValues;  // Unowned BSON, in index key order.
     const std::string _indexIdent;
     const std::string _indexName;
 
