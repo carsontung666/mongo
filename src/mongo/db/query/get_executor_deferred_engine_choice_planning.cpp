@@ -26,7 +26,10 @@
 #include "mongo/db/query/query_planner_params_diagnostic_printer.h"
 #include "mongo/db/stats/counters.h"
 
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -55,6 +58,95 @@ boost::optional<CachedSolutionPair> retrievePlanFromCache(
     }
 
     return {std::make_pair(std::move(cs), std::move(statusWithQs.getValue()))};
+}
+
+/**
+ * Ceiling probe for caching the plans of hinted, single-solution classic queries.
+ *
+ * The classic plan cache excludes hinted queries (classic_plan_cache.cpp, shouldCacheQuery) and has
+ * no store path for single-solution plans at all -- its only writer runs off a MultiPlanStage.
+ * Building both is a large change, so this memo prices the win first. The hit path calls the same
+ * QueryPlanner::planFromCache() a real cache hit would, and returns through the same
+ * SingleSolutionPassthroughPlanner the planning path below returns, so the two arms differ only in
+ * whether QueryPlanner::plan() ran.
+ *
+ * Deliberately incorrect, and never to be enabled outside an A/B measurement: the memo is
+ * process-wide, is keyed on a hash that does not encode the hint (so two hints on one shape
+ * collide), is never invalidated by index or collection drops, and never evicts. It also bypasses
+ * shouldCacheQuery(), which would trip the dassert in QueryPlanner::planFromCache() on a debug
+ * build. Gated by MONGO_PROBE_HINTED_PLAN_MEMO, read once per process.
+ */
+bool hintedPlanMemoEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MONGO_PROBE_HINTED_PLAN_MEMO");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+std::mutex hintedPlanMemoMutex;
+std::unordered_map<uint32_t, std::unique_ptr<SolutionCacheData>> hintedPlanMemo;
+
+std::unique_ptr<QuerySolution> tryHintedPlanMemo(const PlanCacheKey& planCacheKey,
+                                                 const CanonicalQuery& cq,
+                                                 const QueryPlannerParams& plannerParams) {
+    if (!hintedPlanMemoEnabled() || cq.getFindCommandRequest().getHint().isEmpty()) {
+        return nullptr;
+    }
+
+    std::unique_ptr<SolutionCacheData> cacheData;
+    {
+        std::lock_guard<std::mutex> guard(hintedPlanMemoMutex);
+        auto entry = hintedPlanMemo.find(planCacheKey.planCacheKeyHash());
+        if (entry == hintedPlanMemo.end()) {
+            return nullptr;
+        }
+        cacheData = entry->second->clone();
+    }
+
+    auto statusWithQs = QueryPlanner::planFromCache(cq, plannerParams, *cacheData);
+    if (!statusWithQs.isOK()) {
+        return nullptr;
+    }
+
+    // Counted as a classic hit so that the probe's activation is visible in serverStatus alongside
+    // the skipped count it does not replace.
+    planCacheCounters.incrementClassicHitsCounter();
+    return std::move(statusWithQs.getValue());
+}
+
+void storeHintedPlanMemo(const PlanCacheKey& planCacheKey,
+                         const CanonicalQuery& cq,
+                         const QuerySolution& solution) {
+    if (!hintedPlanMemoEnabled()) {
+        return;
+    }
+
+    const bool hinted = !cq.getFindCommandRequest().getHint().isEmpty();
+    const bool eligible = solution.isEligibleForPlanCache();
+    const bool hasCacheData = static_cast<bool>(solution.cacheData);
+    if (!hinted || !eligible || !hasCacheData) {
+        LOGV2_DEBUG(99000001,
+                    1,
+                    "hinted plan memo: declined to store",
+                    "hinted"_attr = hinted,
+                    "eligibleForPlanCache"_attr = eligible,
+                    "hasCacheData"_attr = hasCacheData);
+        return;
+    }
+
+    auto cacheData = solution.cacheData->clone();
+    cacheData->indexFilterApplied = solution.indexFilterApplied;
+    cacheData->solutionHash = solution.hash();
+
+    {
+        std::lock_guard<std::mutex> guard(hintedPlanMemoMutex);
+        hintedPlanMemo.insert_or_assign(planCacheKey.planCacheKeyHash(), std::move(cacheData));
+    }
+    LOGV2_DEBUG(99000002,
+                1,
+                "hinted plan memo: stored",
+                "keyHash"_attr = planCacheKey.planCacheKeyHash());
 }
 
 // If the given query should read from the plan cache, fetches the cached solution data, runs engine
@@ -111,7 +203,8 @@ StatusWith<std::unique_ptr<PlannerInterface>> planWithCBR(
     const std::shared_ptr<QueryPlannerParams>& plannerParams,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     const MultipleCollectionAccessor& collections,
-    boost::optional<size_t> cachedPlanHash) {
+    boost::optional<size_t> cachedPlanHash,
+    const PlanCacheKey& planCacheKey) {
     auto makePlannerData = [&]() {
         return PlannerData{opCtx,
                            cq,
@@ -169,6 +262,7 @@ StatusWith<std::unique_ptr<PlannerInterface>> planWithCBR(
 
     if (rankerResult.solutions.size() == 1 && !shouldMultiPlanForSingleSolution(rankerResult, cq)) {
         rankerResult.solutions[0]->indexFilterApplied = plannerParams->indexFiltersApplied;
+        storeHintedPlanMemo(planCacheKey, *cq, *rankerResult.solutions[0]);
         return std::make_unique<SingleSolutionPassthroughPlanner>(
             makePlannerData(),
             std::move(rankerResult.solutions[0]),
@@ -275,6 +369,12 @@ StatusWith<std::unique_ptr<PlannerInterface>> preparePlanner(
         }
     }
 
+    // Ceiling probe: rebuild a hinted query's plan from the memo rather than planning it. Returns
+    // through the same path the single-solution case below uses.
+    if (auto memoSolution = tryHintedPlanMemo(planCacheKey, *cq, *plannerParams)) {
+        return buildSingleSolutionPlanner(std::move(memoSolution), cachedPlanHash);
+    }
+
     // If there's no plan in the cache for this query, we invoke planning.
     incrementPlannerInvocationCount();
 
@@ -303,7 +403,8 @@ StatusWith<std::unique_ptr<PlannerInterface>> preparePlanner(
     }
 
     if (plannerParams->isCBREnabled()) {
-        return planWithCBR(opCtx, cq, plannerParams, yieldPolicy, collections, cachedPlanHash);
+        return planWithCBR(
+            opCtx, cq, plannerParams, yieldPolicy, collections, cachedPlanHash, planCacheKey);
     }
 
     auto solutions = uassertStatusOK(QueryPlanner::plan(*cq, *plannerParams));
@@ -317,6 +418,7 @@ StatusWith<std::unique_ptr<PlannerInterface>> preparePlanner(
         !cq->getExpCtxRaw()->getQueryKnobConfiguration().getUseMultiplannerForSingleSolutions()) {
         // Only one possible plan. Build the stages from the solution.
         solutions[0]->indexFilterApplied = plannerParams->indexFiltersApplied;
+        storeHintedPlanMemo(planCacheKey, *cq, *solutions[0]);
         return buildSingleSolutionPlanner(std::move(solutions[0]), cachedPlanHash);
     }
     // CBR is disabled; multiple candidate plans will be ranked by the classic multi-planner.
