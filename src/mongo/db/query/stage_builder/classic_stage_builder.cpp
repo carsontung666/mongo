@@ -39,6 +39,7 @@
 #include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
 #include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
 #include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/db/shard_role/shard_catalog/index_catalog.h"
 #include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
@@ -60,6 +61,135 @@
 
 
 namespace mongo::stage_builder {
+namespace {
+/**
+ * The components of a covered projection to fold into an index scan: one flag per key component,
+ * and the output field name for each included one. The Ordering is not here because it comes from
+ * the index catalog entry, which only buildIndexScan() has.
+ */
+struct CoveredProjectionSpec {
+    std::vector<bool> includeKey;
+    std::vector<std::string> fieldNames;
+};
+
+std::unique_ptr<PlanStage> buildIndexScan(OperationContext* opCtx,
+                                          const CanonicalQuery& cq,
+                                          const CollectionAcquisition& collection,
+                                          WorkingSet* ws,
+                                          const IndexScanNode* ixn,
+                                          boost::optional<CoveredProjectionSpec> coveredProjection) {
+    const auto& collectionPtr = collection.getCollectionPtr();
+    invariant(collectionPtr);
+    const auto* entry = collectionPtr->getIndexCatalog()->findIndexByIdent(
+        opCtx, ixn->index.indexCatalogEntryStorage->getIdent());
+
+    uassert(ErrorCodes::QueryPlanKilled,
+            str::stream() << "Index descriptor not found. Namespace: "
+                          << collectionPtr->ns().toStringForErrorMsg()
+                          << ", CanonicalQuery: " << cq.toStringShortForErrorMsg()
+                          << ", IndexEntry: " << ixn->index.toString(),
+            entry);
+
+    // We use the node's internal name, keyPattern and multikey details here. For
+    // $** indexes, these may differ from the information recorded in the index's
+    // descriptor.
+    IndexScanParams params{entry,
+                           ixn->index.identifier.catalogName,
+                           ixn->index.keyPattern,
+                           ixn->index.multikeyPaths,
+                           ixn->index.multikey};
+    params.bounds = ixn->bounds;
+    params.direction = ixn->direction;
+    params.addKeyMetadata = ixn->addKeyMetadata;
+    params.shouldDedup = ixn->shouldDedup;
+
+    std::unique_ptr<IndexScan::CoveredProjection> folded;
+    if (coveredProjection) {
+        // The Ordering has to be the one the key was encoded with, which is the descriptor's --
+        // the same value the storage layer's cursor decodes with. The node's key pattern is a
+        // planner-side view of it and is documented as possibly differing for $** indexes.
+        folded = std::make_unique<IndexScan::CoveredProjection>(entry->ordering());
+        folded->includeKey = std::move(coveredProjection->includeKey);
+        folded->fieldNameStorage = std::move(coveredProjection->fieldNames);
+        folded->fieldNames.reserve(folded->fieldNameStorage.size());
+        for (const auto& name : folded->fieldNameStorage) {
+            folded->fieldNames.emplace_back(name);
+        }
+    }
+
+    return std::make_unique<IndexScan>(cq.getExpCtxRaw(),
+                                       collection,
+                                       std::move(params),
+                                       ws,
+                                       ixn->filter.get(),
+                                       std::move(folded));
+}
+
+boost::optional<CoveredProjectionSpec> tryFoldCoveredProjectionIntoIxscan(
+    const CanonicalQuery& cq, const ProjectionNodeCovered* pn) {
+    if (!internalQueryEnableFusedCoveredProjection.load()) {
+        return boost::none;
+    }
+
+    if (pn->children.size() != 1 || pn->children[0]->getType() != STAGE_IXSCAN) {
+        return boost::none;
+    }
+    const auto* ixn = static_cast<const IndexScanNode*>(pn->children[0].get());
+
+    // Everything else that reads the materialised index key has to be absent, because the fused
+    // scan never builds one. A residual filter is evaluated against the key. Deduplication needs
+    // the RecordId, which the fused path does not decode -- and this one is load-bearing, not
+    // defensive: an index that is multikey overall can still fully provide a field whose path is
+    // not multikey, so PROJECTION_COVERED over a deduplicating IXSCAN is reachable, and fusing it
+    // would emit a row per index entry instead of per document. addKeyMetadata re-hydrates the
+    // whole key; it cannot currently co-occur with a covered projection, and is checked anyway.
+    if (ixn->filter || ixn->shouldDedup || ixn->addKeyMetadata) {
+        return boost::none;
+    }
+
+    // The projection has to be a plain set of inclusions whose fields all come from the key --
+    // exactly what ProjectionStageCovered already asserts for itself. This is also what keeps
+    // $meta projections and showRecordId away: both make the projection non-simple, so they are
+    // planned as PROJECTION_DEFAULT and never reach here.
+    if (!pn->proj.isSimple() || !pn->proj.isInclusionOnly()) {
+        return boost::none;
+    }
+
+    // Belt and braces: a distinct rewrite plans a DISTINCT_SCAN leaf rather than an IXSCAN, so the
+    // child check above already excludes it.
+    if (cq.getDistinct()) {
+        return boost::none;
+    }
+
+    CoveredProjectionSpec spec;
+    const StringSet includedFields{pn->proj.getRequiredFields().begin(),
+                                   pn->proj.getRequiredFields().end()};
+    size_t included = 0;
+    // Built from the scan's own key pattern, not pn->coveredKeyObj: the decoder walks components
+    // in the order the index encoded them, and these two objects are only guaranteed to agree
+    // because the covered projection's single leaf is this very scan.
+    for (auto&& elt : ixn->index.keyPattern) {
+        auto it = includedFields.find(elt.fieldNameStringData());
+        if (it == includedFields.end()) {
+            spec.includeKey.push_back(false);
+            spec.fieldNames.emplace_back();
+        } else {
+            spec.includeKey.push_back(true);
+            spec.fieldNames.emplace_back(*it);
+            ++included;
+        }
+    }
+
+    // If some required field is not in the key the projection is not actually covered by it; the
+    // planner should not have produced this shape, but do not guess.
+    if (included != includedFields.size()) {
+        return boost::none;
+    }
+
+    return spec;
+}
+}  // namespace
+
 // Returns a non-null pointer to the root of a plan tree, or a non-OK status if the PlanStage tree
 // could not be constructed.
 //
@@ -95,33 +225,12 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
                     expCtx, _collection, params, _ws, csn->filter.get());
             }
             case STAGE_IXSCAN: {
-                const IndexScanNode* ixn = static_cast<const IndexScanNode*>(root);
-
-                invariant(collectionPtr);
-                const auto* entry = collectionPtr->getIndexCatalog()->findIndexByIdent(
-                    _opCtx, ixn->index.indexCatalogEntryStorage->getIdent());
-
-                uassert(ErrorCodes::QueryPlanKilled,
-                        str::stream() << "Index descriptor not found. Namespace: "
-                                      << collectionPtr->ns().toStringForErrorMsg()
-                                      << ", CanonicalQuery: " << _cq.toStringShortForErrorMsg()
-                                      << ", IndexEntry: " << ixn->index.toString(),
-                        entry);
-
-                // We use the node's internal name, keyPattern and multikey details here. For
-                // $** indexes, these may differ from the information recorded in the index's
-                // descriptor.
-                IndexScanParams params{entry,
-                                       ixn->index.identifier.catalogName,
-                                       ixn->index.keyPattern,
-                                       ixn->index.multikeyPaths,
-                                       ixn->index.multikey};
-                params.bounds = ixn->bounds;
-                params.direction = ixn->direction;
-                params.addKeyMetadata = ixn->addKeyMetadata;
-                params.shouldDedup = ixn->shouldDedup;
-                return std::make_unique<IndexScan>(
-                    expCtx, _collection, std::move(params), _ws, ixn->filter.get());
+                return buildIndexScan(_opCtx,
+                                      _cq,
+                                      _collection,
+                                      _ws,
+                                      static_cast<const IndexScanNode*>(root),
+                                      boost::none);
             }
             case STAGE_FETCH: {
                 const FetchNode* fn = static_cast<const FetchNode*>(root);
@@ -184,7 +293,32 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             }
             case STAGE_PROJECTION_COVERED: {
                 auto pn = static_cast<const ProjectionNodeCovered*>(root);
-                auto childStage = build(pn->children[0].get());
+
+                // A covered projection directly over an index scan re-reads and re-copies a key
+                // the scan has just materialised in full. When nothing else consumes that key,
+                // fold the projection into the scan so the key is decoded once, straight into the
+                // projected object.
+                //
+                // The stage itself stays in the tree. Deleting it would leave the plan-stage tree
+                // with fewer nodes than the QuerySolution, which explain attribution and exact
+                // cardinality estimation both walk in lockstep; instead the scan produces the
+                // projected objects and this stage passes them through.
+                auto fused = tryFoldCoveredProjectionIntoIxscan(_cq, pn);
+                std::unique_ptr<PlanStage> childStage;
+                if (fused) {
+                    const auto* ixn = static_cast<const IndexScanNode*>(pn->children[0].get());
+                    childStage = buildIndexScan(_opCtx,
+                                                _cq,
+                                                _collection,
+                                                _ws,
+                                                ixn,
+                                                std::move(fused));
+                    if (_planStageQsnMap) {
+                        _planStageQsnMap->insert({childStage.get(), ixn});
+                    }
+                } else {
+                    childStage = build(pn->children[0].get());
+                }
                 return std::make_unique<ProjectionStageCovered>(
                     _cq.getExpCtxRaw(),
                     // In case of a "distinct" query, we may add a projection stage without the
@@ -195,7 +329,8 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
                     &pn->proj,
                     _ws,
                     std::move(childStage),
-                    pn->coveredKeyObj);
+                    pn->coveredKeyObj,
+                    fused.has_value());
             }
             case STAGE_PROJECTION_SIMPLE: {
                 auto pn = static_cast<const ProjectionNodeSimple*>(root);
@@ -522,4 +657,5 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
     }
     return result;
 }
+
 }  // namespace mongo::stage_builder

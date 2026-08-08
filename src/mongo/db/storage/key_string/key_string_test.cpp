@@ -1434,6 +1434,64 @@ TEST_P(KeyStringBuilderTest, RandomizedInputsForToBsonSafe) {
     }
 }
 
+/**
+ * toBsonProjectedSafe() must agree, component for component, with decoding the whole key and then
+ * picking fields out of it. Every subset of a four-component key is checked against that
+ * reference, so a decode that desynchronises the positional TypeBits reader when it skips a
+ * component cannot pass.
+ */
+TEST_P(KeyStringBuilderTest, ProjectedDecodeMatchesFullDecodeForEverySubset) {
+    // Embedded NULs have to be built with an explicit length; a bare C string would stop short.
+    const std::string_view withNul("with\0nul", 8);
+    const std::string_view twoNuls("a\0\0b", 4);
+    std::vector<BSONObj> keys = {
+        BSON("" << "alpha" << "" << 1 << "" << "gamma" << "" << 2.5),
+        BSON("" << withNul << "" << 9007199254740993LL << "" << "" << "" << BSONNULL),
+        BSON("" << twoNuls << "" << 7 << "" << std::string(500, 'x') << "" << true),
+        BSON("" << MINKEY << "" << Date_t::fromMillisSinceEpoch(0) << "" << MAXKEY << "" << -0.0),
+    };
+    // V0 KeyStrings cannot encode NumberDecimal.
+    if (version != key_string::Version::V0) {
+        keys.push_back(BSON("" << twoNuls << "" << Decimal128("1.0000000000000000000000001") << ""
+                               << std::string(500, 'x') << "" << true));
+    }
+    const std::vector<std::string_view> names = {"w", "x", "y", "z"};
+
+    for (const auto& ordering : {ALL_ASCENDING, Ordering::make(BSON("a" << 1 << "b" << -1 << "c" << 1
+                                                                       << "d" << -1))}) {
+        for (const auto& key : keys) {
+            key_string::Builder ks(version, key, ordering);
+            const BSONObj full = key_string::toBsonSafe(ks.getView(), ordering, ks.getTypeBits());
+
+            for (uint32_t mask = 0; mask < (1u << names.size()); ++mask) {
+                std::vector<bool> include;
+                std::vector<std::string_view> fieldNames;
+                for (size_t i = 0; i < names.size(); ++i) {
+                    include.push_back((mask >> i) & 1u);
+                    fieldNames.push_back(names[i]);
+                }
+
+                BSONObjBuilder expected;
+                size_t i = 0;
+                for (auto&& elt : full) {
+                    if (include[i]) {
+                        expected.appendAs(elt, fieldNames[i]);
+                    }
+                    ++i;
+                }
+
+                BufBuilder scratch;
+                BSONObjBuilder actual;
+                key_string::TypeBits::Reader reader(ks.getTypeBits());
+                key_string::toBsonProjectedSafe(
+                    ks.getView(), ordering, reader, include, fieldNames, actual, scratch);
+
+                ASSERT_BSONOBJ_EQ(expected.obj(), actual.obj());
+            }
+        }
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(KeyStringBuilderTest,
                          KeyStringBuilderTest,
                          testing::Values(key_string::Version::V0, key_string::Version::V1));

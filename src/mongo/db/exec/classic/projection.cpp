@@ -224,9 +224,11 @@ ProjectionStageCovered::ProjectionStageCovered(ExpressionContext* expCtx,
                                                const projection_ast::Projection* projection,
                                                WorkingSet* ws,
                                                std::unique_ptr<PlanStage> child,
-                                               const BSONObj& coveredKeyObj)
+                                               const BSONObj& coveredKeyObj,
+                                               bool childAlreadyProjected)
     : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_COVERED"},
-      _coveredKeyObj{coveredKeyObj} {
+      _coveredKeyObj{coveredKeyObj},
+      _childAlreadyProjected{childAlreadyProjected} {
     tassert(7241733,
             "covered projections must be simple and only consist of inclusions",
             projection->isSimple() && projection->isInclusionOnly());
@@ -257,6 +259,12 @@ ProjectionStageCovered::ProjectionStageCovered(ExpressionContext* expCtx,
 }
 
 void ProjectionStageCovered::transform(WorkingSetMember* member) const {
+    if (_childAlreadyProjected) {
+        // The index scan decoded the wanted key components straight into the output object; the
+        // member is already an owned, projected object.
+        return;
+    }
+
     BSONObjBuilder bob;
 
     // We're pulling data out of the key.

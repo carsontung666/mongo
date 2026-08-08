@@ -17,7 +17,6 @@
 #include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/util/assert_util.h"
 
-
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 
@@ -28,6 +27,20 @@ int sgn(int i) {
     if (i == 0)
         return 0;
     return i > 0 ? 1 : -1;
+}
+
+/**
+ * Hands 'obj' to 'member' as an owned object, reusing the DocumentStorage already on the member.
+ * Mirrors mongo::(anonymous)::transitionMemberToOwnedObj in exec/classic/projection.cpp, which is
+ * what the PROJECTION_COVERED parent calls when the projection is not folded into the scan.
+ */
+void transitionMemberToOwnedObj(const mongo::BSONObj& obj, mongo::WorkingSetMember* member) {
+    mongo::MutableDocument md(std::move(member->doc.value()));
+    md.reset(obj, false);
+    member->keyData.clear();
+    member->recordId = {};
+    member->doc = {{}, md.freeze()};
+    member->transitionToOwnedObj();
 }
 
 }  // namespace
@@ -41,9 +54,11 @@ IndexScan::IndexScan(ExpressionContext* expCtx,
                      CollectionAcquisition collection,
                      IndexScanParams params,
                      WorkingSet* workingSet,
-                     const MatchExpression* filter)
+                     const MatchExpression* filter,
+                     std::unique_ptr<CoveredProjection> coveredProjection)
     : RequiresIndexStage(kStageType, expCtx, collection, params.indexEntry, workingSet),
       _workingSet(workingSet),
+      _coveredProjection(std::move(coveredProjection)),
       _keyPattern(params.keyPattern.getOwned()),
       _bounds(std::move(params.bounds)),
       _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
@@ -73,6 +88,38 @@ IndexScan::IndexScan(ExpressionContext* expCtx,
                                    ->infoObj()
                                    .getObjectField(IndexDescriptor::kCollationFieldName)
                                    .getOwned();
+    _specificStats.coveredProjection = static_cast<bool>(_coveredProjection);
+}
+
+void IndexScan::projectKeyValueView(const SortedDataKeyValueView& view, WorkingSetMember* member) {
+    auto keyString = view.getKeyStringWithoutRecordIdView();
+    auto typeBitsView = view.getTypeBitsView();
+    BufReader typeBitsReaderBuf(typeBitsView.data(), typeBitsView.size());
+    auto typeBitsReader =
+        key_string::TypeBits::getReaderFromBuffer(view.getVersion(), &typeBitsReaderBuf);
+
+    // The object has to own its bytes: the member's Document holds on to it past this call.
+    BSONObjBuilder bob;
+    key_string::toBsonProjectedSafe(keyString,
+                                    _coveredProjection->ordering,
+                                    typeBitsReader,
+                                    _coveredProjection->includeKey,
+                                    _coveredProjection->fieldNames,
+                                    bob,
+                                    _coveredProjection->discardBuf);
+    transitionMemberToOwnedObj(bob.obj(), member);
+}
+
+void IndexScan::projectMaterialisedKey(const BSONObj& key, WorkingSetMember* member) {
+    BSONObjBuilder bob;
+    size_t i = 0;
+    for (auto&& elt : key) {
+        if (i < _coveredProjection->includeKey.size() && _coveredProjection->includeKey[i]) {
+            bob.appendAs(elt, _coveredProjection->fieldNames[i]);
+        }
+        ++i;
+    }
+    transitionMemberToOwnedObj(bob.obj(), member);
 }
 
 boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
@@ -131,6 +178,49 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
 }
 
 PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
+    // Steady-state path for a folded-in covered projection: decode the wanted key components
+    // straight out of the KeyString into the output object, so the key is never materialised in
+    // full only to be walked and copied again.
+    //
+    // Restricted to GETTING_NEXT with no IndexBoundsChecker, because the checker is the one
+    // remaining consumer of the materialised key that the stage builder cannot rule out in advance
+    // -- it is created inside initIndexScan(). The seek paths fall through to the general path and
+    // project from the materialised key; they run once per scan, not once per key.
+    if (_coveredProjection && _scanState == GETTING_NEXT && !_checker) {
+        SortedDataKeyValueView view;
+        const auto viewRet = handlePlanStageYield(
+            expCtx(),
+            "IndexScan",
+            [&] {
+                view =
+                    _indexCursor->nextKeyValueView(*shard_role_details::getRecoveryUnit(opCtx()));
+                return PlanStage::ADVANCED;
+            },
+            [&] {
+                // yieldHandler
+                *out = WorkingSet::INVALID_ID;
+            });
+
+        if (viewRet != PlanStage::ADVANCED) {
+            return viewRet;
+        }
+
+        if (view.isEmpty()) {
+            _scanState = HIT_END;
+            _commonStats.isEOF = true;
+            _indexCursor.reset();
+            _specificStats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+            return PlanStage::IS_EOF;
+        }
+
+        ++_specificStats.keysExamined;
+
+        WorkingSetID id = _workingSet->allocate();
+        projectKeyValueView(view, _workingSet->get(id));
+        *out = id;
+        return PlanStage::ADVANCED;
+    }
+
     // Get the next kv pair from the index, if any.
     boost::optional<IndexKeyEntry> kv;
 
@@ -261,6 +351,17 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
         uassert(11130304,
                 "Exceeded memory limit in record id deduplicator for IXSCAN stage",
                 _memoryTracker.withinMemoryLimit(opCtx()));
+    }
+
+    // A folded-in covered projection reached the general path -- a seek, or a scan that turned out
+    // to need an IndexBoundsChecker. Project from the materialised key so the output is the same
+    // whichever path produced it. Done before getOwned(): the projected object owns its own bytes,
+    // so owning the whole key first would be a copy thrown away on every key of such a scan.
+    if (_coveredProjection) {
+        WorkingSetID projectedId = _workingSet->allocate();
+        projectMaterialisedKey(kv->key, _workingSet->get(projectedId));
+        *out = projectedId;
+        return PlanStage::ADVANCED;
     }
 
     if (!kv->key.isOwned())
