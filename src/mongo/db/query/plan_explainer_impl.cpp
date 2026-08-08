@@ -341,6 +341,9 @@ void appendStageStructure(const QuerySolutionNode* querySolutionNode,
         bob->appendBool("isPartial", spec->isPartial);
         bob->append("indexVersion", spec->indexVersion);
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
+        if (spec->coveredProjection) {
+            bob->appendBool("coveredProjection", true);
+        }
 
         if ((topLevelBob->len() + spec->indexBounds.objsize()) >
             internalQueryExplainSizeThresholdBytes.load()) {

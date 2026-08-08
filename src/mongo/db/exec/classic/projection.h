@@ -125,12 +125,20 @@ public:
     /**
      * ProjectionNodeCovered should obtain a fast-path object through this constructor.
      */
+    /**
+     * 'childAlreadyProjected' is set when the child index scan was built with the projection
+     * folded into it, so the members arriving here are already the projected objects. The stage
+     * stays in the tree in that case -- it keeps the plan-stage tree in step with the
+     * QuerySolution, which explain, plan ranking and exact cardinality estimation all rely on --
+     * but transform() has nothing left to do.
+     */
     ProjectionStageCovered(ExpressionContext* expCtx,
                            const BSONObj& projObj,
                            const projection_ast::Projection* projection,
                            WorkingSet* ws,
                            std::unique_ptr<PlanStage> child,
-                           const BSONObj& coveredKeyObj);
+                           const BSONObj& coveredKeyObj,
+                           bool childAlreadyProjected = false);
 
     StageType stageType() const final {
         return STAGE_PROJECTION_COVERED;
@@ -152,6 +160,9 @@ private:
 
     // If the i-th entry of _includeKey is true this is the field name for the i-th key field.
     std::vector<std::string_view> _keyFieldNames;
+
+    // The child index scan already produced the projected object; see the constructor.
+    const bool _childAlreadyProjected;
 };
 
 /**

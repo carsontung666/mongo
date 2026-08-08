@@ -4,6 +4,8 @@
 #pragma once
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/classic/plan_stage.h"
 #include "mongo/db/exec/classic/recordid_deduplicator.h"
 #include "mongo/db/exec/classic/requires_index_stage.h"
@@ -26,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <boost/optional/optional.hpp>
 
@@ -106,11 +109,48 @@ public:
         HIT_END
     };
 
+    /**
+     * A covered projection folded into this scan.
+     *
+     * When set, the stage emits an OWNED_OBJ member holding only the selected key components under
+     * 'fieldNames', instead of an index-key member for a PROJECTION_COVERED parent to re-copy. The
+     * two vectors are indexed by key-component position and are the same pair
+     * ProjectionStageCovered computes for itself.
+     *
+     * Only the stage builder sets this, and only when the scan has no filter, no deduplication and
+     * no index-key metadata request -- those are the other readers of the materialised key.
+     */
+    struct CoveredProjection {
+        explicit CoveredProjection(Ordering ordering_) : ordering(ordering_) {}
+
+        // 'fieldNames' points into 'fieldNameStorage', so this must not be copied or moved.
+        CoveredProjection(const CoveredProjection&) = delete;
+        CoveredProjection& operator=(const CoveredProjection&) = delete;
+
+        // The Ordering that encoded the key, taken from the index descriptor -- the same source
+        // the storage layer decodes with. Held here rather than on the stage so that scans
+        // without a folded-in projection neither compute nor store it.
+        Ordering ordering;
+
+        std::vector<bool> includeKey;
+        // Backing storage for 'fieldNames', which is what the decoder wants.
+        std::vector<std::string> fieldNameStorage;
+        std::vector<std::string_view> fieldNames;
+
+        // Absorbs excluded key components, which must be decoded to keep the TypeBits reader in
+        // step but are never read. Reused across keys so the fused path does not allocate for
+        // them; sized 0 so it costs nothing until the first excluded component. The projected
+        // object cannot share it -- the WorkingSetMember's Document keeps a reference, so that
+        // one has to own its bytes.
+        BufBuilder discardBuf{0};
+    };
+
     IndexScan(ExpressionContext* expCtx,
               CollectionAcquisition collection,
               IndexScanParams params,
               WorkingSet* workingSet,
-              const MatchExpression* filter);
+              const MatchExpression* filter,
+              std::unique_ptr<CoveredProjection> coveredProjection = nullptr);
 
     StageState doWork(WorkingSetID* out) final;
     bool isEOF() const final;
@@ -156,8 +196,25 @@ private:
      */
     boost::optional<IndexKeyEntry> initIndexScan();
 
+    /**
+     * Fills 'member' with the projected form of the key currently under the cursor, decoding
+     * straight from the KeyString without materialising the whole key first. Only valid while the
+     * view returned by nextKeyValueView() is live.
+     */
+    void projectKeyValueView(const SortedDataKeyValueView& view, WorkingSetMember* member);
+
+    /**
+     * Fills 'member' with the projected form of an already-materialised key. Used on the seek
+     * paths, which run once per scan rather than once per key.
+     */
+    void projectMaterialisedKey(const BSONObj& key, WorkingSetMember* member);
+
     // The WorkingSet we fill with results.  Not owned by us.
     WorkingSet* const _workingSet;
+
+    // Set only when the stage builder folded a PROJECTION_COVERED into this scan; see
+    // CoveredProjection.
+    const std::unique_ptr<CoveredProjection> _coveredProjection;
 
     std::unique_ptr<SortedDataInterface::Cursor> _indexCursor;
     const BSONObj _keyPattern;

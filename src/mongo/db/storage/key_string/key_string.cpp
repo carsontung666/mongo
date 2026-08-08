@@ -2765,6 +2765,62 @@ void toBsonSafe(std::span<const char> data,
     return toBsonSafe(data, ord, typeBitsReader, builder);
 }
 
+void toBsonProjectedSafe(std::span<const char> data,
+                         Ordering ord,
+                         TypeBits::ReaderBase& typeBitsReader,
+                         const std::vector<bool>& includeComponent,
+                         const std::vector<std::string_view>& fieldNames,
+                         BSONObjBuilder& builder,
+                         BufBuilder& scratch) {
+    invariant(includeComponent.size() == fieldNames.size());
+
+    scratch.reset();
+    // Excluded components still have to be decoded so that 'reader' and 'typeBitsReader' stay in
+    // step, but nothing reads what they decode to. They land here and are thrown away together.
+    boost::optional<BSONObjBuilder> discard;
+
+    auto reader = makeBufReader(data);
+    for (int i = 0; reader.remaining(); i++) {
+        const bool invert = (ord.get(i) == -1);
+        uint8_t ctype = readType<uint8_t>(&reader, invert);
+        if (ctype == kLess || ctype == kGreater) {
+            // A discriminator, logically part of the previous field; only present on queries, not
+            // on keys stored in an index. Same handling as toBsonSafe().
+            ctype = readType<uint8_t>(&reader, invert);
+        }
+
+        if (ctype == kEnd)
+            break;
+
+        if (static_cast<size_t>(i) < includeComponent.size() && includeComponent[i]) {
+            toBsonValue(ctype,
+                        &reader,
+                        &typeBitsReader,
+                        invert,
+                        typeBitsReader.version(),
+                        builder << fieldNames[i],
+                        1);
+        } else {
+            if (!discard) {
+                discard.emplace(scratch);
+            }
+            toBsonValue(ctype,
+                        &reader,
+                        &typeBitsReader,
+                        invert,
+                        typeBitsReader.version(),
+                        *discard << "",
+                        1);
+        }
+    }
+
+    if (discard) {
+        // Make the length write explicit rather than leaving it to the destructor; the bytes are
+        // dropped when the caller next resets 'scratch'.
+        discard->doneFast();
+    }
+}
+
 int Value::compareWithoutDiscriminator(const Value& other) const {
     return key_string::compare(withoutDiscriminatorAtEnd(getView()),
                                withoutDiscriminatorAtEnd(other.getView()));

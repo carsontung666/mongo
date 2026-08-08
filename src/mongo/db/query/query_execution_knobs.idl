@@ -767,6 +767,18 @@ server_parameters:
                 fcv:
                     min: "9.0"
 
+    internalQueryEnableFusedCoveredProjection:
+        description: >-
+            When true, a covered projection sitting directly on top of an index scan is folded into
+            the scan, which then decodes only the projected key components straight out of the
+            KeyString instead of materialising the whole index key for the projection to copy a
+            second time. Applies only when nothing else consumes the materialised key.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryEnableFusedCoveredProjection"
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
     internalQueryDisableLookupExecutionUsingHashJoin:
         description: >-
             Disable lookup execution using hash join algorithm, this will cause the plans,

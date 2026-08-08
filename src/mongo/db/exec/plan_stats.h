@@ -631,6 +631,11 @@ struct IndexScanStats : public SpecificStats {
         visitor->visit(this);
     }
 
+    // True when a covered projection was folded into this scan, so it emits projected objects
+    // rather than index keys. Only reported in explain when true, so plans that did not fuse
+    // serialise exactly as before.
+    bool coveredProjection = false;
+
     // Index type being used.
     std::string indexType;
 
