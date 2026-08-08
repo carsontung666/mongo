@@ -30,6 +30,13 @@ public:
                       SeekableRecordCursor* cursor,
                       const CollectionPtr& collection,
                       const NamespaceString& ns);
+
+    /**
+     * Puts 'obj' on 'member' as an owned object, reusing the DocumentStorage the member already
+     * holds rather than allocating a new one. Clears the index-key and RecordId state, since an
+     * OWNED_OBJ member no longer corresponds to a stored document.
+     */
+    static void transitionToOwnedObj(const BSONObj& obj, WorkingSetMember* member);
 };
 
 }  // namespace mongo

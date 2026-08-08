@@ -35,6 +35,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <absl/hash/hash.h>
 #include <boost/container/flat_set.hpp>
@@ -1289,6 +1290,31 @@ void toBsonSafe(std::span<const char> data,
                 Ordering ord,
                 TypeBits::ReaderBase& typeBitsReader,
                 BSONObjBuilder& builder);
+
+/**
+ * Decodes a KeyString directly into its projected BSON form, appending only the components
+ * selected by 'includeComponent' and naming each with the corresponding entry of 'fieldNames'.
+ *
+ * This exists for covered projections, where the caller wants a subset of the key under real field
+ * names. Routing that through toBsonSafe() materialises every component under a placeholder name
+ * into an intermediate object, which is then walked and copied a second time; this appends the
+ * wanted components once, under their final names.
+ *
+ * Components are always traversed in order, excluded ones included: skipping a component's decode
+ * would desynchronise 'typeBitsReader', whose reads are positional. Excluded components are
+ * decoded into 'scratch', which the caller owns so that it can be reused across keys. Its contents
+ * are meaningless; it is reset on entry.
+ *
+ * 'includeComponent' and 'fieldNames' are indexed by key-component position. A component whose
+ * position is beyond their extent is excluded.
+ */
+void toBsonProjectedSafe(std::span<const char> data,
+                         Ordering ord,
+                         TypeBits::ReaderBase& typeBitsReader,
+                         const std::vector<bool>& includeComponent,
+                         const std::vector<std::string_view>& fieldNames,
+                         BSONObjBuilder& builder,
+                         BufBuilder& scratch);
 
 Discriminator decodeDiscriminator(std::span<const char> data,
                                   Ordering ord,

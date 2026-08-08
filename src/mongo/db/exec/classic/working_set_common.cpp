@@ -194,4 +194,13 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
     return true;
 }
 
+void WorkingSetCommon::transitionToOwnedObj(const BSONObj& obj, WorkingSetMember* member) {
+    MutableDocument md(std::move(member->doc.value()));
+    md.reset(obj, false);
+    member->keyData.clear();
+    member->recordId = {};
+    member->doc = {{}, md.freeze()};
+    member->transitionToOwnedObj();
+}
+
 }  // namespace mongo

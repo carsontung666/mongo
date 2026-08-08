@@ -4,6 +4,9 @@
 #include "mongo/bson/bson_validate.h"
 #include "mongo/db/storage/key_string/key_string.h"
 
+#include <string_view>
+#include <vector>
+
 const mongo::Ordering kAllAscending = mongo::Ordering::make(mongo::BSONObj());
 const mongo::Ordering kOneDescending = mongo::Ordering::make(BSON("a" << -1));
 const auto kV1 = mongo::key_string::Version::V1;
@@ -94,6 +97,30 @@ extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
         auto validationResult = mongo::validateBSON(obj.objdata(), obj.objsize());
         invariant(validationResult.isOK() ||
                   validationResult.code() == mongo::ErrorCodes::NonConformantBSON);
+    } catch (const mongo::AssertionException&) {
+        // We need to catch exceptions caused by invalid inputs
+    }
+
+    try {
+        // The projected decode is a second parser over the same bytes and must be equally
+        // resilient to malformed input. Alternate the inclusion pattern so both the "append it"
+        // and "decode it and throw it away" branches see every component position.
+        std::vector<bool> includeComponent;
+        std::vector<std::string_view> fieldNames;
+        static constexpr std::string_view kNames[] = {"a", "b", "c", "d", "e", "f", "g", "h"};
+        for (size_t i = 0; i < mongo::Ordering::kMaxCompoundIndexKeys; ++i) {
+            includeComponent.push_back(i % 2 == 0);
+            fieldNames.push_back(kNames[i % std::size(kNames)]);
+        }
+        mongo::BufBuilder scratch;
+        mongo::BSONObjBuilder builder;
+        mongo::key_string::TypeBits::Reader reader(tb);
+        mongo::key_string::toBsonProjectedSafe(
+            keyString, ord, reader, includeComponent, fieldNames, builder, scratch);
+        mongo::BSONObj projected = builder.obj();
+        auto projectedValidation = mongo::validateBSON(projected.objdata(), projected.objsize());
+        invariant(projectedValidation.isOK() ||
+                  projectedValidation.code() == mongo::ErrorCodes::NonConformantBSON);
     } catch (const mongo::AssertionException&) {
         // We need to catch exceptions caused by invalid inputs
     }

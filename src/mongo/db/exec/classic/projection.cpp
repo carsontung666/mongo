@@ -3,6 +3,8 @@
 
 #include "mongo/db/exec/classic/projection.h"
 
+#include "mongo/db/exec/classic/working_set_common.h"
+
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/classic/plan_stage.h"
@@ -34,11 +36,7 @@ void transitionMemberToOwnedObj(Document&& doc, WorkingSetMember* member) {
 }
 
 void transitionMemberToOwnedObj(const BSONObj& bo, WorkingSetMember* member) {
-    // Use the DocumentStorage that already exists on the WorkingSetMember's document
-    // field if possible.
-    MutableDocument md(std::move(member->doc.value()));
-    md.reset(bo, false);
-    transitionMemberToOwnedObj(md.freeze(), member);
+    WorkingSetCommon::transitionToOwnedObj(bo, member);
 }
 
 /**
@@ -257,6 +255,13 @@ ProjectionStageCovered::ProjectionStageCovered(ExpressionContext* expCtx,
 }
 
 void ProjectionStageCovered::transform(WorkingSetMember* member) const {
+    if (member->hasObj()) {
+        // The scan below folded this projection in and decoded the wanted key components straight
+        // into the output object. Only that path can hand this stage an object rather than an
+        // index key, so there is nothing left to do.
+        return;
+    }
+
     BSONObjBuilder bob;
 
     // We're pulling data out of the key.
