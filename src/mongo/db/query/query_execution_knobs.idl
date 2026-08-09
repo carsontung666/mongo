@@ -701,6 +701,20 @@ server_parameters:
                 fcv:
                     min: "9.0"
 
+    internalQueryDisableCompoundFieldExpressExecutor:
+        description: "Knob to control whether a conjunction of equalities covering the leading fields of an index can use the express executor. Single-field equalities are governed by internalQueryDisableSingleFieldExpressExecutor and are unaffected."
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryDisableCompoundFieldExpressExecutor"
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: disableCompoundFieldExpressExecutor
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
     internalQueryEnablePlanShapeAnalysis:
         mod_visibility: needs_replacement
         description: "Knob to control whether we collect plan shape counters for query stats."
