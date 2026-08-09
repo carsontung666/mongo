@@ -12,6 +12,7 @@
 #include "mongo/db/shard_role/shard_catalog/scoped_collection_metadata.h"
 #include "mongo/util/modules.h"
 
+#include <boost/container/small_vector.hpp>
 #include <boost/optional/optional.hpp>
 
 
@@ -66,6 +67,9 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForDelet
  * fields. If not, returns nullptr. If an index exists, that can cover project, will return this
  * index and set coversProjection flag to true.
  */
+/** Equality operands in index key order; sized like ExpressEqualityList. */
+using ExpressKeyOperands = boost::container::small_vector<BSONElement, 4>;
+
 boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
     const CanonicalQuery& cq, const QueryPlannerParams& plannerParams);
 

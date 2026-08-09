@@ -15,6 +15,8 @@
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/util/modules.h"
 
+#include <boost/container/small_vector.hpp>
+
 namespace mongo {
 /**
  * Returns 'true' if 'sortPattern' contains any sort pattern parts that share a common prefix, false
@@ -72,6 +74,13 @@ struct ExpressEquality {
 };
 
 /**
+ * Express predicates are short by construction -- one equality, or a conjunction covering the
+ * leading fields of one index -- so the operands live inline and the decomposition costs no
+ * allocation. Four covers every compound index shape seen in practice; longer ones spill.
+ */
+using ExpressEqualityList = boost::container::small_vector<ExpressEquality, 4>;
+
+/**
  * Decomposes 'me' into the equalities the express executor would have to bind, and returns 'true'
  * if it is either a single equality or a conjunction of equalities on pairwise-distinct paths, all
  * generating exact bounds.
@@ -83,7 +92,7 @@ struct ExpressEquality {
  *
  * 'out' is left in an unspecified state when this returns 'false'.
  */
-inline bool collectExpressEqualities(const MatchExpression* me, std::vector<ExpressEquality>* out) {
+inline bool collectExpressEqualities(const MatchExpression* me, ExpressEqualityList* out) {
     const auto addOne = [&out](const MatchExpression* node) {
         if (node->matchType() != MatchExpression::EQ) {
             return false;
@@ -146,8 +155,15 @@ inline bool isEqualityExpressEligibleQuery(const CollectionPtr& collection,
     }
 
     // Properties of the query's match expression.
-    std::vector<ExpressEquality> equalities;
-    return collectExpressEqualities(me, &equalities);
+    ExpressEqualityList equalities;
+    if (!collectExpressEqualities(me, &equalities)) {
+        return false;
+    }
+    if (equalities.size() > 1 &&
+        cq.getExpCtx()->getQueryKnobConfiguration().getDisableCompoundFieldExpressExecutor()) {
+        return false;
+    }
+    return true;
 }
 
 /**

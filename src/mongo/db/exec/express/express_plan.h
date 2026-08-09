@@ -45,6 +45,7 @@
 #include <utility>
 #include <variant>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/optional/optional.hpp>
 #include <fmt/format.h>
 
@@ -637,7 +638,7 @@ public:
      * order. A single-field equality passes a vector of size one; a conjunction of equalities
      * fully covering a compound index passes one element per key field.
      */
-    LookupViaUserIndex(std::vector<BSONElement> filterValues,
+    LookupViaUserIndex(boost::container::small_vector<BSONElement, 4> filterValues,
                        std::string indexIdent,
                        std::string indexName,
                        const CollatorInterface* collator,
@@ -794,7 +795,7 @@ private:
         return entry;
     }
 
-    std::vector<BSONElement> _filterValues;  // Unowned BSON, in index key order.
+    boost::container::small_vector<BSONElement, 4> _filterValues;  // Unowned, key order.
     const std::string _indexIdent;
     const std::string _indexName;
 

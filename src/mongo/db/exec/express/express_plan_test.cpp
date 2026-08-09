@@ -35,6 +35,8 @@
 #include <utility>
 #include <variant>
 
+#include <boost/container/small_vector.hpp>
+
 namespace mongo::express {
 namespace {
 using namespace std::literals::string_view_literals;
@@ -315,7 +317,7 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithMatchingQuery) {
     auto filter = fromjson("{a: 5}");
     CollatorInterface* collator = nullptr;
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        std::vector<BSONElement>{filter.firstElement()},
+        boost::container::small_vector<BSONElement, 4>{filter.firstElement()},
         indexEntry->getIdent(),
         std::string{indexName},
         collator,
@@ -355,7 +357,7 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCompoundEquality) {
     // Both key fields are bound, so the seek must land on exactly one key: not {_id: 0}, which
     // shares only the leading field, and not {_id: 2}, which shares only the trailing one.
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        std::vector<BSONElement>{filter["a"], filter["b"]},
+        boost::container::small_vector<BSONElement, 4>{filter["a"], filter["b"]},
         indexEntry->getIdent(),
         std::string{indexName},
         collator,
@@ -395,7 +397,7 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCompoundEqualityAndOpenTrailin
     auto filter = fromjson("{a: 5, b: 7}");
     CollatorInterface* collator = nullptr;
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        std::vector<BSONElement>{filter["a"], filter["b"]},
+        boost::container::small_vector<BSONElement, 4>{filter["a"], filter["b"]},
         indexEntry->getIdent(),
         std::string{indexName},
         collator,
@@ -427,7 +429,7 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithMatchingQueryUsingCollator) {
     IteratorStats iteratorStats;
     auto filter = fromjson("{a: 'iii'}");
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        std::vector<BSONElement>{filter.firstElement()},
+        boost::container::small_vector<BSONElement, 4>{filter.firstElement()},
         indexEntry->getIdent(),
         std::string{indexName},
         collator,
@@ -465,7 +467,7 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWWithNonMatchingQuery) {
     auto filter = fromjson("{a: 7}");
     CollatorInterface* collator = nullptr;
     LookupViaUserIndex<FetchFromCollectionCallback> iterator(
-        std::vector<BSONElement>{filter.firstElement()},
+        boost::container::small_vector<BSONElement, 4>{filter.firstElement()},
         indexEntry->getIdent(),
         std::string{indexName},
         collator,
@@ -512,7 +514,7 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCoveredProjection) {
     auto projection = parseProjection(operationContext(), fromjson("{_id: 0, a: 1, c: 1}"));
 
     LookupViaUserIndex<CreateDocumentFromIndexKey> iterator(
-        std::vector<BSONElement>{filter.firstElement()},
+        boost::container::small_vector<BSONElement, 4>{filter.firstElement()},
         indexEntry->getIdent(),
         std::string{indexName},
         collator,

@@ -60,8 +60,8 @@
 namespace mongo {
 
 // Defined below; used by makeExpressExecutorForFindByUserIndex, which precedes it.
-boost::optional<std::vector<BSONElement>> orderEqualitiesForIndex(
-    const IndexEntry& index, const std::vector<ExpressEquality>& equalities);
+boost::optional<ExpressKeyOperands> orderEqualitiesForIndex(const IndexEntry& index,
+                                                            const ExpressEqualityList& equalities);
 
 MONGO_FAIL_POINT_DEFINE(expressExecutorHangBeforeLogAndBackoff);
 MONGO_FAIL_POINT_DEFINE(expressExecutorHangBeforeTemporarilyUnavailableBackoff);
@@ -685,7 +685,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForFindB
 
     const CollatorInterface* collator = cq->getCollator();
     const projection_ast::Projection* projection = cq->getProj();
-    std::vector<ExpressEquality> equalities;
+    ExpressEqualityList equalities;
     tassert(10269303,
             "Invalid match expression",
             collectExpressEqualities(cq->getPrimaryMatchExpression(), &equalities));
@@ -888,7 +888,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForDelet
 
 bool canCoverProjection(const IndexEntry& index,
                         const OrderedPathSet& paths,
-                        const std::vector<ExpressEquality>& equalities,
+                        const ExpressEqualityList& equalities,
                         bool collationRelevantForFilter) {
     if (index.multikey && index.multikeyPaths.empty()) {
         return false;
@@ -929,21 +929,15 @@ bool canCoverProjection(const IndexEntry& index,
  * filter, which the express executor cannot apply. A multikey leading field is rejected because one
  * document can produce several index keys, so a seek is no longer a point lookup.
  */
-boost::optional<std::vector<BSONElement>> orderEqualitiesForIndex(
-    const IndexEntry& index, const std::vector<ExpressEquality>& equalities) {
-    const size_t nKeys = static_cast<size_t>(index.keyPattern.nFields());
-    if (nKeys < equalities.size()) {
-        return boost::none;
-    }
-
+boost::optional<ExpressKeyOperands> orderEqualitiesForIndex(const IndexEntry& index,
+                                                            const ExpressEqualityList& equalities) {
     // A single equality keeps exactly the behaviour this function had before compound support was
     // added: the leading field must be the constrained path, and nothing else is required of the
     // index here. The extra conditions below apply only to the compound case they were added for,
     // so that admitting conjunctions cannot change which indexes a single equality accepts.
     const bool isCompound = equalities.size() > 1;
 
-    std::vector<BSONElement> ordered;
-    ordered.reserve(equalities.size());
+    ExpressKeyOperands ordered;
     size_t keyPatternFieldIndex = 0;
     for (auto&& elt : index.keyPattern) {
         if (ordered.size() == equalities.size()) {
@@ -980,9 +974,24 @@ boost::optional<std::vector<BSONElement>> orderEqualitiesForIndex(
     return ordered;
 }
 
+/**
+ * The condition findRelevantIndices applied when it copied entries out: the index's leading field
+ * is one the predicate constrains, and a sparse index is only relevant where the field map says so.
+ * Applied in place here so nothing is copied to be filtered.
+ */
+bool indexIsRelevant(const IndexEntry& index, const RelevantFieldIndexMap& fields) {
+    BSONObjIterator it(index.keyPattern);
+    if (!it.more()) {
+        return false;
+    }
+    const std::string fieldName = std::string{it.next().fieldNameStringData()};
+    const auto found = fields.find(fieldName);
+    return found != fields.end() && (!index.sparse || found->second.isSparse);
+}
+
 bool indexCanSupportExpressPlan(const IndexEntry& index,
                                 const CanonicalQuery& cq,
-                                const std::vector<ExpressEquality>& equalities,
+                                const ExpressEqualityList& equalities,
                                 bool collationRelevant) {
     return index.type == IndexType::INDEX_BTREE &&
         (!collationRelevant ||
@@ -999,14 +1008,16 @@ bool indexCanSupportExpressPlan(const IndexEntry& index,
 }
 
 const IndexEntry* findBestIndexEntry(const std::vector<IndexEntry>& indexes,
+                                     const RelevantFieldIndexMap& fields,
                                      const CanonicalQuery& cq,
-                                     const std::vector<ExpressEquality>& equalities,
+                                     const ExpressEqualityList& equalities,
                                      const bool collationRelevant) {
     int fewestIdxKeys = Ordering::kMaxCompoundIndexKeys + 1;
     const IndexEntry* bestEntry = nullptr;
 
     for (const auto& e : indexes) {
-        if (!indexCanSupportExpressPlan(e, cq, equalities, collationRelevant)) {
+        if (!indexIsRelevant(e, fields) ||
+            !indexCanSupportExpressPlan(e, cq, equalities, collationRelevant)) {
             continue;
         }
 
@@ -1022,15 +1033,17 @@ const IndexEntry* findBestIndexEntry(const std::vector<IndexEntry>& indexes,
 }
 
 const IndexEntry* findBestCoveringIndexEntry(const std::vector<IndexEntry>& indexes,
+                                             const RelevantFieldIndexMap& fields,
                                              const OrderedPathSet& dependencies,
                                              const CanonicalQuery& cq,
-                                             const std::vector<ExpressEquality>& equalities,
+                                             const ExpressEqualityList& equalities,
                                              const bool collationRelevant) {
     int fewestCoveringIdxKeys = Ordering::kMaxCompoundIndexKeys + 1;
     const IndexEntry* bestCoveringEntry = nullptr;
 
     for (const auto& e : indexes) {
-        if (!indexCanSupportExpressPlan(e, cq, equalities, collationRelevant)) {
+        if (!indexIsRelevant(e, fields) ||
+            !indexCanSupportExpressPlan(e, cq, equalities, collationRelevant)) {
             continue;
         }
 
@@ -1056,7 +1069,7 @@ boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
     // Not a tassert: this is also reached for predicates that never passed the eligibility check,
     // for example an equality to null, which does not generate exact bounds. Those simply have no
     // express index.
-    std::vector<ExpressEquality> equalities;
+    ExpressEqualityList equalities;
     if (!collectExpressEqualities(cq.getPrimaryMatchExpression(), &equalities) ||
         equalities.empty()) {
         return boost::none;
@@ -1067,17 +1080,24 @@ boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
                 e.data.type() == BSONType::array;
         });
 
+    // Relevance is decided in place rather than by copying the matching entries out.
+    // findRelevantIndices returns std::vector<IndexEntry> by value, and an IndexEntry carries two
+    // std::strings, a BSONObj, a MultikeyPaths vector-of-sets and a shared_ptr, so each match costs
+    // several allocations and an atomic refcount pair -- on every express-eligible query. A profile
+    // of a compound point lookup attributes 1.15% of server CPU to IndexEntry's copy constructor
+    // and another 1.15% to ~CoreIndexInfo, both under tryExpress. Only the winner is copied now, at
+    // the single return point below.
     RelevantFieldIndexMap fields;
     QueryPlannerIXSelect::getFields(cq.getPrimaryMatchExpression(), &fields);
-    std::vector<IndexEntry> indexes =
-        QueryPlannerIXSelect::findRelevantIndices(fields, plannerParams.mainCollectionInfo.indexes);
+    const auto& indexes = plannerParams.mainCollectionInfo.indexes;
 
     const OrderedPathSet* dependencies = nullptr;
     if (cq.getProj() && cq.getProj()->type() == projection_ast::ProjectType::kInclusion) {
         dependencies = &cq.getProj()->getRequiredFields();
     }
 
-    const IndexEntry* bestEntry = findBestIndexEntry(indexes, cq, equalities, collationRelevant);
+    const IndexEntry* bestEntry =
+        findBestIndexEntry(indexes, fields, cq, equalities, collationRelevant);
     if (!bestEntry) {
         return boost::none;
     }
@@ -1106,12 +1126,15 @@ boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
     if (dependencies && !needsShardFilter) {
         // TODO SERVER-108344: Add shard filter fields to dependencies to support shard filtering.
         if (const auto* bestCoveringEntry = findBestCoveringIndexEntry(
-                indexes, *dependencies, cq, equalities, collationRelevant)) {
-            return IndexForExpressEquality(std::move(*bestCoveringEntry),
-                                           true /*coversProjection*/);
+                indexes, fields, *dependencies, cq, equalities, collationRelevant)) {
+            // Copied, not moved: `indexes` now aliases the caller's QueryPlannerParams rather than
+            // a local vector, so moving out of it would gut the entry the caller still owns. The
+            // pointer is const, so std::move here would have decayed to a copy anyway; spelling it
+            // as a copy keeps that from reading like an oversight.
+            return IndexForExpressEquality(*bestCoveringEntry, true /*coversProjection*/);
         }
     }
-    return IndexForExpressEquality(std::move(*bestEntry), false /*coversProjection*/);
+    return IndexForExpressEquality(*bestEntry, false /*coversProjection*/);
 }
 
 }  // namespace mongo
