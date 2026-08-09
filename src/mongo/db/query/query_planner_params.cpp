@@ -16,6 +16,7 @@
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/db/query/query_settings_decoration.h"
+#include "mongo/db/query/query_utils.h"
 #include "mongo/db/query/wildcard_multikey_paths.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/s/query/shard_key_pattern_query_util.h"
@@ -602,8 +603,16 @@ void QueryPlannerParams::fillOutIndexEntriesForExpressEquality(
     // returns from tryExpress before building any planner parameters: measured on point_query_bm at
     // 175,524 retired instructions per operation against 97,885, both express, both returning one
     // document.
-    RelevantFieldIndexMap fields;
-    QueryPlannerIXSelect::getFields(canonicalQuery.getPrimaryMatchExpression(), &fields);
+    // The candidate test needs only the paths the predicate constrains, and for express there are
+    // at most a handful of them, held inline. Building a RelevantFieldIndexMap for this -- an absl
+    // hash table, allocated per query, populated by walking the expression through
+    // FieldRef::dottedSubstring -- costs more than scanning the list it would be built from.
+    ExpressEqualityList equalities;
+    if (!collectExpressEqualities(canonicalQuery.getPrimaryMatchExpression(), &equalities)) {
+        // Not an express-shaped predicate. Nothing here can serve it; the caller falls through to
+        // full planning, which builds its own entries.
+        return;
+    }
 
     const bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
     for (auto&& ice :
@@ -619,16 +628,21 @@ void QueryPlannerParams::fillOutIndexEntriesForExpressEquality(
             continue;
         }
 
-        // Same condition findRelevantIndices would have applied downstream, hoisted ahead of
-        // construction: the leading field must be one the predicate constrains, and a sparse index
-        // is only a candidate where the field map says so.
         BSONObjIterator keyIt(descriptor->keyPattern());
         if (!keyIt.more()) {
             continue;
         }
-        const auto leading = fields.find(std::string{keyIt.next().fieldNameStringData()});
-        if (leading == fields.end() ||
-            (descriptor->behavesAsSparse() && !leading->second.isSparse)) {
+        const std::string_view leading = keyIt.next().fieldNameStringData();
+        const auto bound =
+            std::find_if(equalities.begin(), equalities.end(), [&](const ExpressEquality& e) {
+                return e.path == leading;
+            });
+        if (bound == equalities.end()) {
+            continue;
+        }
+        // A sparse index does not contain a document missing the field, so it can only answer an
+        // equality that no missing field could match -- i.e. anything but null.
+        if (descriptor->behavesAsSparse() && bound->data.isNull()) {
             continue;
         }
 
