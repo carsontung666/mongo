@@ -272,6 +272,18 @@ struct [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlannerParams {
     }
 
     /**
+     * Fills in only what the express index-equality fast path reads: the main collection's index
+     * entries, with query settings and index filters applied so the fast path cannot pick an index
+     * the user has excluded. Everything else fillOutMainCollectionPlannerParams does -- collection
+     * stats and the knob-driven planner options -- is left out, because express does not plan.
+     *
+     * Callers that fall through to real planning must still build the full parameters.
+     */
+    void fillOutIndexEntriesForExpressEquality(OperationContext* opCtx,
+                                               const CanonicalQuery& canonicalQuery,
+                                               const MultipleCollectionAccessor& collections);
+
+    /**
      * Initializes query planner parameters by filling in main collection info and fetching main
      * collection indexes.
      */

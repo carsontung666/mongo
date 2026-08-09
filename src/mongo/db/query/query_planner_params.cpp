@@ -583,6 +583,62 @@ void QueryPlannerParams::fillOutMainCollectionPlannerParams(
         opCtx, mainColl, &mainCollectionInfo.stats, false /* includeSizeStats */);
 }
 
+void QueryPlannerParams::fillOutIndexEntriesForExpressEquality(
+    OperationContext* opCtx,
+    const CanonicalQuery& canonicalQuery,
+    const MultipleCollectionAccessor& collections) {
+    const auto& mainColl = collections.getMainCollection();
+    if (!mainColl) {
+        return;
+    }
+
+    // Filter on the catalog entry before constructing anything. fillOutIndexEntries builds a full
+    // IndexEntry -- two std::strings, a BSONObj, MultikeyPaths and a shared_ptr -- for every ready
+    // index on the collection, and the express equality path then reads one and discards the rest.
+    // Whether an index can serve the predicate at all is decided by its leading key field, which is
+    // readable straight off the descriptor, so the construction is only paid for candidates.
+    //
+    // This is why the indexed-equality express path costs markedly more than the _id one, which
+    // returns from tryExpress before building any planner parameters: measured on point_query_bm at
+    // 175,524 retired instructions per operation against 97,885, both express, both returning one
+    // document.
+    RelevantFieldIndexMap fields;
+    QueryPlannerIXSelect::getFields(canonicalQuery.getPrimaryMatchExpression(), &fields);
+
+    const bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
+    for (auto&& ice :
+         mainColl->getIndexCatalog()->getEntriesShared(IndexCatalog::InclusionPolicy::kReady)) {
+        const auto* descriptor = ice->descriptor();
+        const auto indexType = descriptor->getIndexType();
+        if (apiStrict &&
+            (indexType == IndexType::INDEX_HAYSTACK || indexType == IndexType::INDEX_TEXT ||
+             descriptor->isSetSparseByUser())) {
+            continue;
+        }
+        if (descriptor->hidden()) {
+            continue;
+        }
+
+        // Same condition findRelevantIndices would have applied downstream, hoisted ahead of
+        // construction: the leading field must be one the predicate constrains, and a sparse index
+        // is only a candidate where the field map says so.
+        BSONObjIterator keyIt(descriptor->keyPattern());
+        if (!keyIt.more()) {
+            continue;
+        }
+        const auto leading = fields.find(std::string{keyIt.next().fieldNameStringData()});
+        if (leading == fields.end() ||
+            (descriptor->behavesAsSparse() && !leading->second.isSparse)) {
+            continue;
+        }
+
+        mainCollectionInfo.indexes.emplace_back(
+            indexEntryFromIndexCatalogEntry(opCtx, mainColl, std::move(ice), canonicalQuery));
+    }
+
+    applyQuerySettingsOrIndexFiltersForMainCollection(canonicalQuery, collections);
+}
+
 void QueryPlannerParams::setTargetSbeStageBuilder(const CanonicalQuery& canonicalQuery,
                                                   const MultipleCollectionAccessor& collections) {
     // Set 'TARGET_SBE_STAGE_BUILDER' on the main collection and the secondary collections. We

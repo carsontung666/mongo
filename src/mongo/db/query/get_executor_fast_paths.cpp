@@ -106,26 +106,34 @@ ExpressResult tryExpress(OperationContext* opCtx,
         return {.executor = std::move(expressExecutor)};
     }
 
-    // The query might still be eligible for express execution via the index equality fast path.
-    // However, that requires the full set of planner parameters for the main collection to be
-    // available and creating those now allows them to be reused for subsequent strategies if
-    // the express index equality one fails.
-    auto paramsForSingleCollectionQuery =
-        makePlannerParams(*canonicalQuery, plannerOptions, boost::none /* replanningData */);
+    // The index equality fast path needs the collection's index list, and nothing else the full
+    // planner parameters carry. Building them eagerly is what makes it markedly more expensive than
+    // the _id path above, which returns before constructing anything: measured on point_query_bm at
+    // 175,524 retired instructions per operation against 97,885 for the _id express path, both
+    // returning one document. So construct the light express-shaped parameters first, try express
+    // with those, and only pay for the full set on the path that actually needs them -- the
+    // fallthrough, where a later strategy will consume them.
+    std::unique_ptr<QueryPlannerParams> paramsForSingleCollectionQuery;
     if (expressEligibility == ExpressEligibility::IndexedEqualityEligible) {
-        if (auto indexEntry =
-                getIndexForExpressEquality(*canonicalQuery, *paramsForSingleCollectionQuery)) {
+        auto expressParams =
+            std::make_unique<QueryPlannerParams>(QueryPlannerParams::ArgsForExpress{
+                opCtx, *canonicalQuery, collections, plannerOptions});
+        expressParams->fillOutIndexEntriesForExpressEquality(opCtx, *canonicalQuery, collections);
+        if (auto indexEntry = getIndexForExpressEquality(*canonicalQuery, *expressParams)) {
             auto expressExecutor = makeExpressExecutorForFindByUserIndex(
                 opCtx,
                 std::move(canonicalQuery),
                 collections.getMainCollectionPtrOrAcquisition(),
                 *indexEntry,
-                getScopedCollectionFilter(opCtx, collections, *paramsForSingleCollectionQuery),
+                getScopedCollectionFilter(opCtx, collections, *expressParams),
                 plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA);
 
             return {.executor = std::move(expressExecutor)};
         }
     }
+
+    paramsForSingleCollectionQuery =
+        makePlannerParams(*canonicalQuery, plannerOptions, boost::none /* replanningData */);
 
     // Allow reuse of the planner params, in case other planning logic needs it.
     return {.plannerParams = std::move(paramsForSingleCollectionQuery)};
