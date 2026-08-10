@@ -466,7 +466,10 @@ assert.commandWorked(coll.createIndex({a: 1, b: 1, c: 1}, {unique: true}));
 runExpressTest({
     coll,
     filter: {a: 1, c: 3},
-    result: [{_id: 100, a: 1, b: 2, c: 3}],
+    result: [
+        {_id: 100, a: 1, b: 2, c: 3},
+        {_id: 101, a: 1, b: 9, c: 3},
+    ],
     usesExpress: false,
 });
 
