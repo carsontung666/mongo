@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/query/query_bm_fixture.h"
+#include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/util/processinfo.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -24,6 +25,11 @@ private:
             .append("uniqueField", uniqueField)
             .append("nonUniqueField", nonUniqueField)
             .append("arrayField", std::vector<long long>{uniqueField, nonUniqueField})
+            // A natural key: a low-cardinality prefix plus an id unique within it. This is the
+            // shape a document keyed by (tenant, id) rather than by _id has, and the pair is
+            // unique, so a conjunction of equalities on it identifies one document.
+            .append("tenantField", static_cast<long long>(index % 16))
+            .append("keyField", static_cast<long long>(index / 16))
             .append("str", str)
             .obj();
     }
@@ -31,7 +37,13 @@ private:
     std::vector<BSONObj> getIndexSpecs() const override {
         return {buildIndexSpec("uniqueField", true),
                 buildIndexSpec("nonUniqueField", false),
-                buildIndexSpec("arrayField", false)};
+                buildIndexSpec("arrayField", false),
+                BSONObjBuilder{}
+                    .append("v", IndexConfig::kLatestIndexVersion)
+                    .append("key", BSON("tenantField" << 1 << "keyField" << 1))
+                    .append("name", "tenantField_1_keyField_1")
+                    .append("unique", true)
+                    .obj()};
     }
 };
 
@@ -47,10 +59,47 @@ BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldPointQuery)
     runBenchmark(BSON("uniqueField" << fieldValue), BSONObj{} /*projection*/, state);
 }
 
+BENCHMARK_DEFINE_F(PointQueryBenchmark, CompoundUniqueFieldPointQuery)
+(benchmark::State& state) {
+    const auto& doc = docs()[docs().size() / 2];
+    runBenchmark(BSON("tenantField" << doc.getField("tenantField").numberLong() << "keyField"
+                                    << doc.getField("keyField").numberLong()),
+                 BSONObj{} /*projection*/,
+                 state);
+}
+
+// The control arm for the one above: the identical query with the compound express path switched
+// off, so it takes the regular planner. Same binary, same collection, same predicate -- the only
+// difference is the knob, so nothing but the express path can account for a difference.
+//
+// The knob must be set through its ServerParameter and not by storing to the underlying atomic:
+// eligibility reads the value from the process-wide QueryKnobSnapshot, which is rebuilt by the
+// on-update hook that only ServerParameter::set() fires. A bare store leaves the snapshot holding
+// the old value, so the arm silently measures express against itself.
+BENCHMARK_DEFINE_F(PointQueryBenchmark, CompoundUniqueFieldPointQueryExpressDisabled)
+(benchmark::State& state) {
+    unittest::ServerParameterGuard knob{"internalQueryDisableCompoundFieldExpressExecutor", true};
+    const auto& doc = docs()[docs().size() / 2];
+    runBenchmark(BSON("tenantField" << doc.getField("tenantField").numberLong() << "keyField"
+                                    << doc.getField("keyField").numberLong()),
+                 BSONObj{} /*projection*/,
+                 state);
+}
+
 BENCHMARK_DEFINE_F(PointQueryBenchmark, NonUniqueFieldPointQuery)
 (benchmark::State& state) {
     int64_t fieldValue = docs().size() / 3;
     runBenchmark(BSON("nonUniqueField" << fieldValue), BSONObj{} /*projection*/, state);
+}
+
+// Calibration for the pair above: the same ablation applied to the single-field express path that
+// already ships. If this shows no effect either, the harness cannot resolve express at this
+// collection size and neither pair says anything about the compound path.
+BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldPointQueryExpressDisabled)
+(benchmark::State& state) {
+    unittest::ServerParameterGuard knob{"internalQueryDisableSingleFieldExpressExecutor", true};
+    int64_t fieldValue = docs().size() / 2;
+    runBenchmark(BSON("uniqueField" << fieldValue), BSONObj{} /*projection*/, state);
 }
 
 BENCHMARK_DEFINE_F(PointQueryBenchmark, ArrayFieldPointQuery)
@@ -121,7 +170,13 @@ static void configureProjectionBenchmarks(benchmark::internal::Benchmark* bm) {
 }
 
 BENCHMARK_REGISTER_F(PointQueryBenchmark, IdPointQuery)->Apply(configureBenchmarks);
+BENCHMARK_REGISTER_F(PointQueryBenchmark, CompoundUniqueFieldPointQuery)
+    ->Apply(configureBenchmarks);
+BENCHMARK_REGISTER_F(PointQueryBenchmark, CompoundUniqueFieldPointQueryExpressDisabled)
+    ->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldPointQuery)->Apply(configureBenchmarks);
+BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldPointQueryExpressDisabled)
+    ->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, NonUniqueFieldPointQuery)->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, ArrayFieldPointQuery)->Apply(configureBenchmarks);
 
