@@ -18,8 +18,10 @@
 #include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/query/planner_analysis.h"
-#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_utils.h"
 #include "mongo/db/query/wildcard_multikey_paths.h"
@@ -35,7 +37,11 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 
+#include <algorithm>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -66,6 +72,201 @@ boost::optional<ScopedCollectionFilter> getScopedCollectionFilter(
         return collFilter;
     }
     return boost::none;
+}
+
+
+struct PrefixScanTarget {
+    const IndexEntry* index;
+    std::vector<BSONElement> prefixValues;
+};
+
+// Hinted/sorted queries skip isExpressEligible(); re-check those refusals here.
+bool isPrefixScanExpressEligibleQuery(const CanonicalQuery& cq) {
+    const auto& findCommand = cq.getFindCommandRequest();
+    return !cq.getExpCtx()->getQueryKnobConfiguration().getDisableSingleFieldExpressExecutor() &&
+        !cq.metadataDeps().any() && !cq.getExpCtx()->getQuerySettings().getQueryFramework() &&
+        (cq.getProj() == nullptr || cq.getProj()->isSimple()) && !findCommand.getReturnKey() &&
+        !findCommand.getBatchSize() && !findCommand.getShowRecordId() &&
+        findCommand.getMin().isEmpty() && findCommand.getMax().isEmpty() &&
+        !findCommand.getSkip() && !findCommand.getTailable();
+}
+
+boost::optional<PrefixScanTarget> getIndexForExpressPrefixScan(
+    const CanonicalQuery& cq,
+    const CollectionPtr& collection,
+    const QueryPlannerParams& params) {
+    if (!internalQueryEnableExpressPrefixScan.load()) {
+        return boost::none;
+    }
+    if (!isPrefixScanExpressEligibleQuery(cq)) {
+        return boost::none;
+    }
+    if (!collection || collection->getClusteredInfo()) {
+        return boost::none;
+    }
+    // tryExpress() runs before planning; a distinct would lose DISTINCT_SCAN.
+    if (cq.getDistinct()) {
+        return boost::none;
+    }
+
+    const auto& findCommand = cq.getFindCommandRequest();
+
+    const MatchExpression* root = cq.getPrimaryMatchExpression();
+    std::vector<const ComparisonMatchExpressionBase*> equalities;
+    if (root->matchType() == MatchExpression::EQ) {
+        equalities.push_back(static_cast<const ComparisonMatchExpressionBase*>(root));
+    } else if (root->matchType() == MatchExpression::AND) {
+        for (size_t i = 0; i < root->numChildren(); ++i) {
+            const auto* child = root->getChild(i);
+            if (child->matchType() != MatchExpression::EQ) {
+                return boost::none;
+            }
+            equalities.push_back(static_cast<const ComparisonMatchExpressionBase*>(child));
+        }
+    } else {
+        return boost::none;
+    }
+    if (equalities.empty()) {
+        return boost::none;
+    }
+    for (size_t i = 0; i < equalities.size(); ++i) {
+        const auto* eq = equalities[i];
+        if (eq->getCollator() != nullptr) {
+            return boost::none;
+        }
+        // {$eq: null} is not exact; no residual filter here.
+        if (!Indexability::isExactBoundsGenerating(eq->getData())) {
+            return boost::none;
+        }
+        // Two equalities on the same path cannot both be a prefix.
+        for (size_t j = 0; j < i; ++j) {
+            if (eq->path() == equalities[j]->path()) {
+                return boost::none;
+            }
+        }
+    }
+
+    const auto& sortObj = findCommand.getSort();
+
+    // This path skips planning, so it must honour the hint itself.
+    const BSONObj& hintObj = findCommand.getHint();
+
+    // Ambiguous key-pattern hint is error 27; don't hide it by picking the first.
+    if (!hintObj.isEmpty() && hintObj.firstElementFieldNameStringData() != "$hint") {
+        size_t matches = 0;
+        for (const auto& index : params.mainCollectionInfo.indexes) {
+            if (hintObj.woCompare(index.keyPattern) == 0 && ++matches > 1) {
+                return boost::none;
+            }
+        }
+    }
+
+    boost::optional<PrefixScanTarget> chosen;
+    for (const auto& index : params.mainCollectionInfo.indexes) {
+        if (!hintObj.isEmpty() &&
+            !hintMatchesNameOrPattern(hintObj, index.identifier.catalogName, index.keyPattern)) {
+            continue;
+        }
+        if (index.type != INDEX_BTREE || index.multikey || index.sparse || index.filterExpr ||
+            !CollatorInterface::collatorsMatch(index.collator, cq.getCollator())) {
+            continue;
+        }
+
+        std::vector<std::string_view> fields;
+        bool allAscending = true;
+        for (auto&& elt : index.keyPattern) {
+            if (!elt.isNumber() || elt.numberInt() != 1) {
+                allAscending = false;
+                break;
+            }
+            // Numeric path components are not marked multikey; no residual filter.
+            FieldRef path{elt.fieldNameStringData()};
+            for (FieldIndex i = 0; i < path.numParts(); ++i) {
+                if (FieldRef::isNumericPathComponentStrict(path.getPart(i))) {
+                    allAscending = false;
+                    break;
+                }
+            }
+            if (!allAscending) {
+                break;
+            }
+            fields.push_back(elt.fieldNameStringData());
+        }
+        if (!allAscending || fields.size() < equalities.size()) {
+            continue;
+        }
+
+        std::vector<BSONElement> values(equalities.size());
+        std::vector<std::string_view> covered;
+        bool matched = true;
+        for (size_t i = 0; i < equalities.size(); ++i) {
+            const ComparisonMatchExpressionBase* found = nullptr;
+            for (const auto* eq : equalities) {
+                if (eq->path() == fields[i]) {
+                    found = eq;
+                    break;
+                }
+            }
+            if (!found) {
+                matched = false;
+                break;
+            }
+            values[i] = found->getData();
+            covered.push_back(fields[i]);
+        }
+        if (!matched) {
+            continue;
+        }
+        // Repeated key-pattern fields can leave an equality unused.
+        bool allEqualitiesUsed = true;
+        for (const auto* eq : equalities) {
+            if (std::find(covered.begin(), covered.end(), eq->path()) == covered.end()) {
+                allEqualitiesUsed = false;
+                break;
+            }
+        }
+        if (!allEqualitiesUsed) {
+            continue;
+        }
+
+        if (!sortObj.isEmpty()) {
+            size_t pos = equalities.size();
+            bool sortSatisfied = true;
+            for (auto&& elt : sortObj) {
+                if (pos >= fields.size() || !elt.isNumber() || elt.numberInt() != 1 ||
+                    elt.fieldNameStringData() != fields[pos]) {
+                    sortSatisfied = false;
+                    break;
+                }
+                ++pos;
+            }
+            if (!sortSatisfied) {
+                continue;
+            }
+        }
+
+        // Always fetches. If any eligible index covers the projection, decline the query.
+        if (const auto* proj = cq.getProj();
+            proj && proj->type() == projection_ast::ProjectType::kInclusion) {
+            const auto& required = proj->getRequiredFields();
+            StringDataSet keyPatternFields;
+            for (auto&& elt : index.keyPattern) {
+                if (elt.isNumber()) {
+                    keyPatternFields.insert(elt.fieldNameStringData());
+                }
+            }
+            if (!index.multikey && std::ranges::all_of(required, [&](const auto& path) {
+                    return keyPatternFields.contains(std::string_view{path});
+                })) {
+                return boost::none;
+            }
+        }
+
+        if (!chosen) {
+            chosen = PrefixScanTarget{&index, std::move(values)};
+        }
+    }
+    return chosen;
 }
 
 }  // namespace
@@ -124,6 +325,20 @@ ExpressResult tryExpress(OperationContext* opCtx,
 
             return {.executor = std::move(expressExecutor)};
         }
+    }
+
+    if (auto target = getIndexForExpressPrefixScan(
+            *canonicalQuery, mainColl, *paramsForSingleCollectionQuery)) {
+        planCacheCounters.incrementClassicSkippedCounter();
+        auto expressExecutor = makeExpressExecutorForPrefixScan(
+            opCtx,
+            std::move(canonicalQuery),
+            collections.getMainCollectionPtrOrAcquisition(),
+            *target->index,
+            std::move(target->prefixValues),
+            getScopedCollectionFilter(opCtx, collections, *paramsForSingleCollectionQuery),
+            plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA);
+        return {.executor = std::move(expressExecutor)};
     }
 
     // Allow reuse of the planner params, in case other planning logic needs it.

@@ -49,6 +49,7 @@
 
 #include <memory>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -187,11 +188,13 @@ public:
     }
 
     void detachFromOperationContext() override {
+        _plan.detachFromOperationContext();
         _opCtx = nullptr;
     }
 
     void reattachToOperationContext(OperationContext* opCtx) override {
         _opCtx = opCtx;
+        _plan.reattachToOperationContext(opCtx);
     }
 
     ExecState getNext(BSONObj* out, RecordId* dlOut) override;
@@ -204,6 +207,9 @@ public:
     }
 
     bool isEOF() const override {
+        if constexpr (Plan::canIterate()) {
+            return isMarkedAsKilled() || (!_stash && _plan.exhausted()) || limitReached();
+        }
         return _plan.exhausted();
     }
 
@@ -236,15 +242,24 @@ public:
     }
 
     void dispose(OperationContext* opCtx) override {
+        _stash.reset();
         _isDisposed = true;
     }
 
     void forceSpill(PlanYieldPolicy* yieldPolicy) override {
-        LOGV2_ERROR(9819200, "An attempt was made to force PlanExecutorExpress to spill.");
+        if constexpr (Plan::canIterate()) {
+            LOGV2_DEBUG(99745625, 2, "PlanExecutorExpress has no spillable state");
+        } else {
+            LOGV2_ERROR(9819200, "An attempt was made to force PlanExecutorExpress to spill.");
+        }
     }
 
     void stashResult(const BSONObj& obj) override {
-        MONGO_UNREACHABLE_TASSERT(8375808);
+        tassert(99745623,
+                "a non-iterating express plan cannot overflow a batch and must never stash",
+                Plan::canIterate());
+        tassert(99745622, "stashed twice without consuming", !_stash);
+        _stash = std::make_unique<BSONObj>(obj.getOwned());
     }
 
     bool isMarkedAsKilled() const override {
@@ -326,6 +341,26 @@ private:
     bool _isDisposed{false};
     Status _killStatus = Status::OK();
 
+    // unique_ptr (8B) not optional<BSONObj> (24B): extra bytes pushed clustered-_id
+    // PlanExecutorExpress out of tcmalloc's 576 class into 640.
+    std::unique_ptr<BSONObj> _stash;
+
+    // Empty on point-lookup instantiations so this does not grow those executors.
+    struct LimitState {
+        boost::optional<long long> limit;
+        long long returned{0};
+    };
+    [[no_unique_address]] std::conditional_t<Plan::canIterate(), LimitState, std::monostate>
+        _limitState;
+
+    bool limitReached() const {
+        if constexpr (Plan::canIterate()) {
+            return _limitState.limit && _limitState.returned >= *_limitState.limit;
+        }
+        return false;
+    }
+
+
     PlanExplainerExpress _planExplainer;
     std::vector<NamespaceStringOrUUID> _secondaryNss;
 
@@ -361,6 +396,15 @@ PlanExecutorExpress<Plan>::PlanExecutorExpress(
       _plan(std::move(plan)),
       _mustReturnOwnedBson(returnOwnedBson) {
     _commonStats.executionTime.precision = precision;
+    if constexpr (Plan::canIterate()) {
+        if (_cq) {
+            // A limit of 0 means "no limit", same as classic.
+            const auto limit = _cq->getFindCommandRequest().getLimit();
+            if (limit && *limit > 0) {
+                _limitState.limit = limit;
+            }
+        }
+    }
     _plan.open(
         _opCtx, collection, recoveryPolicy, &_planStats, &_iteratorStats, &_writeOperationStats);
 }
@@ -379,6 +423,25 @@ PlanExecutor::ExecState PlanExecutorExpress<Plan>::getNext(BSONObj* out, RecordI
 
         checkFailPointPlanExecAlwaysFails(nss());
 
+        if (limitReached()) {
+            return ExecState::IS_EOF;
+        }
+
+        // Stash is inside the timer / fail-point / interrupt scope.
+        if (_stash) {
+            _opCtx->checkForInterrupt();
+            uassertStatusOK(_killStatus);
+            tassert(99745624, "stashed express result has no RecordId", !dlOut);
+            if (out) {
+                *out = std::move(*_stash);
+            }
+            _stash.reset();
+            if constexpr (Plan::canIterate()) {
+                ++_limitState.returned;
+            }
+            return ExecState::ADVANCED;
+        }
+
         express::PlanProgress progress((express::Ready()));
         while (!haveOutput) {
             if (_plan.exhausted()) {
@@ -386,6 +449,7 @@ PlanExecutor::ExecState PlanExecutorExpress<Plan>::getNext(BSONObj* out, RecordI
             }
 
             _opCtx->checkForInterrupt();
+            uassertStatusOK(_killStatus);
 
             progress = _plan.proceed(_opCtx, [&](RecordId rid, BSONObj obj) {
                 if (dlOut) {
@@ -415,6 +479,9 @@ PlanExecutor::ExecState PlanExecutorExpress<Plan>::getNext(BSONObj* out, RecordI
         out->makeOwned();
     }
 
+    if constexpr (Plan::canIterate()) {
+        ++_limitState.returned;
+    }
     return ExecState::ADVANCED;
 }
 
@@ -662,6 +729,42 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForFindB
 std::ostream& operator<<(std::ostream& stream, const IndexForExpressEquality& i) {
     return stream << "{index: " << i.index.toString()
                   << ", coversProjection: " << i.coversProjection << "}";
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForPrefixScan(
+    OperationContext* opCtx,
+    std::unique_ptr<CanonicalQuery> cq,
+    CollectionAcquisition coll,
+    const IndexEntry& index,
+    std::vector<BSONElement> prefixValues,
+    boost::optional<ScopedCollectionFilter> collectionFilter,
+    bool returnOwnedBson) {
+    const auto indexEntry = coll.getCollectionPtr()->getIndexCatalog()->findIndexByName(
+        opCtx, index.identifier.catalogName);
+    tassert(99745621,
+            fmt::format("Attempt to build a prefix-scan plan for a nonexistent index -- "
+                        "namespace: {}, index: {}",
+                        coll.getCollectionPtr()->ns().toStringForErrorMsg(),
+                        index.toString()),
+            indexEntry);
+
+    // Argument evaluation is unsequenced; do not read these in the same call that moves 'cq'.
+    const CollatorInterface* collator = cq->getCollator();
+    const projection_ast::Projection* projection = cq->getProj();
+
+    return makeExpressExecutor(
+        opCtx,
+        express::PrefixScanViaUserIndex<express::FetchFromCollectionCallback>(
+            std::move(prefixValues),
+            indexEntry->getIdent(),
+            index.identifier.catalogName,
+            collator,
+            projection),
+        express::NoWriteOperation(),
+        std::move(cq),
+        coll,
+        std::move(collectionFilter),
+        returnOwnedBson);
 }
 
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForFindByUserIndex(

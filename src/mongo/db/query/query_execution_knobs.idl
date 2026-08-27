@@ -701,6 +701,14 @@ server_parameters:
                 fcv:
                     min: "9.0"
 
+    internalQueryEnableExpressPrefixScan:
+        description: "Knob to control whether equality-prefix index scans can use the express executor. Off by default."
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryEnableExpressPrefixScan"
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
     internalQueryEnablePlanShapeAnalysis:
         mod_visibility: needs_replacement
         description: "Knob to control whether we collect plan shape counters for query stats."
