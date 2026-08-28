@@ -15,6 +15,7 @@
 #include "mongo/util/modules.h"
 
 #include <cstddef>
+#include <string_view>
 
 #include <boost/optional/optional.hpp>
 
@@ -127,5 +128,13 @@ public:
         const boost::optional<ClusteredCollectionInfo>& clusteredInfo,
         const CollatorInterface* clusteredCollectionCollator);
 };
+
+/**
+ * Whether 'hintObj' names or describes 'index'. Hinting by name takes the shape
+ * {$hint: <indexName>}; anything else is a key pattern.
+ */
+bool hintMatchesNameOrPattern(const BSONObj& hintObj,
+                              std::string_view indexName,
+                              BSONObj indexKeyPattern);
 
 }  // namespace mongo

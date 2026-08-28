@@ -57,6 +57,7 @@ selector:
     # Asserts that queries can use the express execution path, which does not support clustered colls.
     - jstests/core/**/express.js
     - jstests/core/**/express_projection.js
+    - jstests/core/**/express_prefix_scan.js
 
   exclude_with_any_tags:
     - assumes_standalone_mongod

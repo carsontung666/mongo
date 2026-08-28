@@ -24,6 +24,7 @@
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/db/shard_role/shard_catalog/collection_options.h"
 #include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/storage/snapshot.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/unittest/death_test.h"
@@ -451,6 +452,178 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCoveredProjection) {
     ASSERT_EQ(iteratorStats.indexName(), "a_1_b_1_c_1");
     ASSERT_BSONOBJ_EQ(iteratorStats.indexKeyPattern(), BSON("a" << 1 << "b" << 1 << "c" << 1));
     ASSERT_EQ(iteratorStats.projectionCovered(), true);
+}
+
+// Last document is Ready; Exhausted on the following call.
+static std::vector<BSONObj> drainPrefixScan(OperationContext* opCtx, auto& iterator) {
+    std::vector<BSONObj> produced;
+    while (true) {
+        bool producedThisCall = false;
+        auto result = iterator.consumeOne(opCtx,
+                                          [&](const CollectionAcquisition,
+                                              RecordId,
+                                              Snapshotted<BSONObj> obj,
+                                              const SeekableRecordCursor*) {
+                                              ASSERT(!producedThisCall);
+                                              producedThisCall = true;
+                                              produced.push_back(obj.value().getOwned());
+                                              return PlanProgress(Ready());
+                                          });
+        if (std::holds_alternative<Exhausted>(result)) {
+            ASSERT(!producedThisCall);
+            return produced;
+        }
+        ASSERT(std::holds_alternative<Ready>(result));
+    }
+}
+
+TEST_F(ExpressPlanTest, TestPrefixScanViaUserIndexReturnsWholeRunInIndexOrder) {
+    std::string_view indexName = "a_1_b_1"sv;
+    auto indexSpec = BSON("v" << 2 << "name" << indexName << "key" << BSON("a" << 1 << "b" << 1));
+    // a:4 and a:6 bracket the run.
+    auto collection = createAndPopulateTestCollectionWithIndex(indexSpec,
+                                                               "{_id: 0, a: 4, b: 9}"sv,
+                                                               "{_id: 1, a: 5, b: 3}"sv,
+                                                               "{_id: 2, a: 5, b: 1}"sv,
+                                                               "{_id: 3, a: 5, b: 2}"sv,
+                                                               "{_id: 4, a: 6, b: 0}"sv);
+    const CollectionPtr& collectionPtr = collection.getCollectionPtr();
+    auto indexEntry =
+        collectionPtr->getIndexCatalog()->findIndexByName(operationContext(), indexName);
+
+    IteratorStats iteratorStats;
+    auto filter = fromjson("{a: 5}");
+    PrefixScanViaUserIndex<FetchFromCollectionCallback> iterator(
+        std::vector<BSONElement>{filter.firstElement()},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        nullptr /*collator*/,
+        nullptr /*projection*/);
+    iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
+
+    auto produced = drainPrefixScan(operationContext(), iterator);
+
+    ASSERT_EQ(produced.size(), 3u);
+    ASSERT_BSONOBJ_EQ(produced[0], fromjson("{_id: 2, a: 5, b: 1}"));
+    ASSERT_BSONOBJ_EQ(produced[1], fromjson("{_id: 3, a: 5, b: 2}"));
+    ASSERT_BSONOBJ_EQ(produced[2], fromjson("{_id: 1, a: 5, b: 3}"));
+
+    ASSERT(std::holds_alternative<Exhausted>(
+        iterateButExpectNoDocument(operationContext(), iterator)));
+
+    ASSERT_EQ(iteratorStats.stageName(), "EXPRESS_PREFIX_IXSCAN");
+    ASSERT_EQ(iteratorStats.numKeysExamined(), 3);
+    ASSERT_EQ(iteratorStats.numDocumentsFetched(), 3);
+    ASSERT_EQ(iteratorStats.indexName(), "a_1_b_1");
+    ASSERT_BSONOBJ_EQ(iteratorStats.indexKeyPattern(), BSON("a" << 1 << "b" << 1));
+}
+
+TEST_F(ExpressPlanTest, TestPrefixScanViaUserIndexWithNoMatchingKeys) {
+    std::string_view indexName = "a_1_b_1"sv;
+    auto indexSpec = BSON("v" << 2 << "name" << indexName << "key" << BSON("a" << 1 << "b" << 1));
+    auto collection = createAndPopulateTestCollectionWithIndex(
+        indexSpec, "{_id: 0, a: 4, b: 9}"sv, "{_id: 1, a: 6, b: 0}"sv);
+    const CollectionPtr& collectionPtr = collection.getCollectionPtr();
+    auto indexEntry =
+        collectionPtr->getIndexCatalog()->findIndexByName(operationContext(), indexName);
+
+    IteratorStats iteratorStats;
+    auto filter = fromjson("{a: 5}");
+    PrefixScanViaUserIndex<FetchFromCollectionCallback> iterator(
+        std::vector<BSONElement>{filter.firstElement()},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        nullptr /*collator*/,
+        nullptr /*projection*/);
+    iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
+
+    ASSERT(std::holds_alternative<Exhausted>(
+        iterateButExpectNoDocument(operationContext(), iterator)));
+    ASSERT_EQ(iteratorStats.numKeysExamined(), 0);
+    ASSERT_EQ(iteratorStats.numDocumentsFetched(), 0);
+}
+
+TEST_F(ExpressPlanTest, TestPrefixScanViaUserIndexWithCompoundEqualityPrefix) {
+    std::string_view indexName = "a_1_b_1_c_1"sv;
+    auto indexSpec =
+        BSON("v" << 2 << "name" << indexName << "key" << BSON("a" << 1 << "b" << 1 << "c" << 1));
+    auto collection = createAndPopulateTestCollectionWithIndex(indexSpec,
+                                                               "{_id: 0, a: 5, b: 1, c: 7}"sv,
+                                                               "{_id: 1, a: 5, b: 2, c: 2}"sv,
+                                                               "{_id: 2, a: 5, b: 2, c: 1}"sv,
+                                                               "{_id: 3, a: 5, b: 3, c: 0}"sv);
+    const CollectionPtr& collectionPtr = collection.getCollectionPtr();
+    auto indexEntry =
+        collectionPtr->getIndexCatalog()->findIndexByName(operationContext(), indexName);
+
+    IteratorStats iteratorStats;
+    auto filter = fromjson("{a: 5, b: 2}");
+    PrefixScanViaUserIndex<FetchFromCollectionCallback> iterator(
+        std::vector<BSONElement>{filter["a"], filter["b"]},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        nullptr /*collator*/,
+        nullptr /*projection*/);
+    iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
+
+    auto produced = drainPrefixScan(operationContext(), iterator);
+
+    ASSERT_EQ(produced.size(), 2u);
+    ASSERT_BSONOBJ_EQ(produced[0], fromjson("{_id: 2, a: 5, b: 2, c: 1}"));
+    ASSERT_BSONOBJ_EQ(produced[1], fromjson("{_id: 1, a: 5, b: 2, c: 2}"));
+    ASSERT_EQ(iteratorStats.numKeysExamined(), 2);
+}
+
+TEST_F(ExpressPlanTest, TestPrefixScanViaUserIndexResumesMidRunAfterSaveAndRestore) {
+    std::string_view indexName = "a_1_b_1"sv;
+    auto indexSpec = BSON("v" << 2 << "name" << indexName << "key" << BSON("a" << 1 << "b" << 1));
+    // Duplicate keys: resume must include RecordId.
+    auto collection = createAndPopulateTestCollectionWithIndex(indexSpec,
+                                                               "{_id: 0, a: 5, b: 1}"sv,
+                                                               "{_id: 1, a: 5, b: 1}"sv,
+                                                               "{_id: 2, a: 5, b: 1}"sv,
+                                                               "{_id: 3, a: 5, b: 2}"sv,
+                                                               "{_id: 4, a: 5, b: 2}"sv,
+                                                               "{_id: 5, a: 6, b: 0}"sv);
+    const CollectionPtr& collectionPtr = collection.getCollectionPtr();
+    auto indexEntry =
+        collectionPtr->getIndexCatalog()->findIndexByName(operationContext(), indexName);
+
+    IteratorStats iteratorStats;
+    auto filter = fromjson("{a: 5}");
+    PrefixScanViaUserIndex<FetchFromCollectionCallback> iterator(
+        std::vector<BSONElement>{filter.firstElement()},
+        indexEntry->getIdent(),
+        std::string{indexName},
+        nullptr /*collator*/,
+        nullptr /*projection*/);
+    iterator.open(operationContext(), collection, /*forWrite=*/false, &iteratorStats);
+
+    std::vector<BSONObj> produced;
+    auto consumeOneDocument = [&]() {
+        auto [result, obj] = iterateAndExpectDocument(operationContext(), iterator);
+        ASSERT(std::holds_alternative<Ready>(result));
+        produced.push_back(obj.getOwned());
+    };
+
+    consumeOneDocument();
+    consumeOneDocument();
+    iterator.releaseResources();
+    // Drop the snapshot as getMore does.
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+    iterator.restoreResources(operationContext(), nullptr /*collection*/, collectionPtr->ns());
+
+    for (auto&& obj : drainPrefixScan(operationContext(), iterator)) {
+        produced.push_back(obj);
+    }
+
+    ASSERT_EQ(produced.size(), 5u);
+    std::vector<int> ids;
+    for (auto&& obj : produced) {
+        ids.push_back(obj["_id"].numberInt());
+    }
+    ASSERT_EQ(ids, (std::vector<int>{0, 1, 2, 3, 4}));
+    ASSERT_EQ(iteratorStats.numKeysExamined(), 5);
 }
 
 TEST_F(ExpressPlanTest, AssertFetchedRecordIsValidBsonAcceptsWellFormedDocument) {

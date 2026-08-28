@@ -24,6 +24,18 @@
 
 namespace mongo {
 
+bool hintMatchesNameOrPattern(const BSONObj& hintObj,
+                              std::string_view indexName,
+                              BSONObj indexKeyPattern) {
+    using namespace std::literals::string_view_literals;
+    BSONElement firstHintElt = hintObj.firstElement();
+    if (firstHintElt.fieldNameStringData() == "$hint"sv &&
+        firstHintElt.type() == BSONType::string) {
+        return indexName == firstHintElt.valueStringData();
+    }
+    return hintObj.woCompare(indexKeyPattern) == 0;
+}
+
 bool QueryPlannerCommon::scanDirectionsEqual(QuerySolutionNode* node, int direction) {
     StageType type = node->getType();
 
