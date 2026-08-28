@@ -1,5 +1,8 @@
 /**
- * Prefix scan must filter orphans across getMore. No sort: a sharded sort never expresses.
+ * The prefix scan declines any query that needs shard filtering, so orphans never reach it. An
+ * orphan rejected by the filter produces no document, which would let one getNext() walk the whole
+ * index range with no yield point; refusing keeps the scan bounded by the batch size. This test
+ * pins the refusal and checks the fallback still returns each owned document exactly once.
  *
  * @tags: [
  *   requires_sharding,
@@ -73,22 +76,25 @@ const shardPlans = explain.queryPlanner.winningPlan.shards;
 assert(shardPlans, "expected a per-shard plan breakdown: " + tojson(explain));
 assert.eq(2, shardPlans.length, "expected the query to reach both shards: " + tojson(explain));
 for (const shardPlan of shardPlans) {
-    const stages = getPlanStages(getWinningPlanFromExplain(shardPlan), "EXPRESS_PREFIX_IXSCAN");
-    assert.eq(1, stages.length, "shard did not use the express prefix scan: " + tojson(shardPlan));
+    const winningPlan = getWinningPlanFromExplain(shardPlan);
+    assert.eq(0,
+              getPlanStages(winningPlan, "EXPRESS_PREFIX_IXSCAN").length,
+              "express prefix scan ran on a shard-filtered query: " + tojson(shardPlan));
+    assert.eq(1,
+              getPlanStages(winningPlan, "SHARDING_FILTER").length,
+              "expected the stage-based plan to filter orphans: " + tojson(shardPlan));
 }
 
-const withFastPath = byId(find().toArray());
+const withKnobOn = byId(find().toArray());
 
 assert.eq(kNumDocs,
-          withFastPath.length,
+          withKnobOn.length,
           "expected each owned document exactly once; a longer result means orphans leaked and a " +
               "shorter one means the scan stopped at a rejected document");
 assert.eq(kNumDocs,
-          new Set(withFastPath.map((doc) => doc._id)).size,
+          new Set(withKnobOn.map((doc) => doc._id)).size,
           "duplicate _ids in the result, which is what a leaked orphan looks like");
-assert.eq(baseline,
-          withFastPath,
-          "the express prefix scan returned a different result set than the stage-based plan");
+assert.eq(baseline, withKnobOn, "turning the knob on changed the result set");
 
 suspendRangeDeletion.off();
 st.stop();

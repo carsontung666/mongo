@@ -10,6 +10,7 @@
  *   directly_against_shardsvrs_incompatible,
  *   transitioning_replicaset_incompatible,
  *   assumes_stable_shard_list,
+ *   assumes_unsharded_collection,
  *   assumes_no_implicit_index_creation,
  *   assumes_read_concern_unchanged,
  *   requires_getmore,
