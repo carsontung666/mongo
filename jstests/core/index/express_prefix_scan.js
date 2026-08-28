@@ -170,7 +170,7 @@ try {
               assertSameWithKnobOff({a: 1, b: 2}, {c: 1, d: 1}),
               "order or contents changed across a run of duplicate keys");
 
-    // Overflow the 16MB batch cap to exercise stashResult().
+    // Overflow the 16MB batch cap.
     coll.drop();
     const big = "x".repeat(200 * 1024);
     const bigDocs = [];

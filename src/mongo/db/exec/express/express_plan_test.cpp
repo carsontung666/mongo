@@ -454,7 +454,7 @@ TEST_F(ExpressPlanTest, TestLookupViaUserIndexWithCoveredProjection) {
     ASSERT_EQ(iteratorStats.projectionCovered(), true);
 }
 
-// Drain until Exhausted. Ready on the last document; Exhausted on the next call.
+// Last document is Ready; Exhausted on the following call.
 static std::vector<BSONObj> drainPrefixScan(OperationContext* opCtx, auto& iterator) {
     std::vector<BSONObj> produced;
     while (true) {
@@ -609,7 +609,7 @@ TEST_F(ExpressPlanTest, TestPrefixScanViaUserIndexResumesMidRunAfterSaveAndResto
     consumeOneDocument();
     consumeOneDocument();
     iterator.releaseResources();
-    // Drop the snapshot as a real yield does.
+    // Drop the snapshot as getMore does.
     shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
     iterator.restoreResources(operationContext(), nullptr /*collection*/, collectionPtr->ns());
 

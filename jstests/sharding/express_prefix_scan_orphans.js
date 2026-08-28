@@ -1,8 +1,5 @@
 /**
- * The prefix scan declines any query that needs shard filtering, so orphans never reach it. An
- * orphan rejected by the filter produces no document, which would let one getNext() walk the whole
- * index range with no yield point; refusing keeps the scan bounded by the batch size. This test
- * pins the refusal and checks the fallback still returns each owned document exactly once.
+ * Prefix scan refuses shard filtering. Fallback must still return each owned document once.
  *
  * @tags: [
  *   requires_sharding,
@@ -27,7 +24,7 @@ assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {sk: 1}}));
 // Index omits the shard key so both shards run the query.
 assert.commandWorked(coll.createIndex({tree: 1, parent: 1, ord: 1}));
 
-const kNumDocs = 250;  // > first-batch 101, so getMore runs with orphan filtering.
+const kNumDocs = 250;  // > first-batch 101.
 const kNumDecoys = 10;
 
 const docs = [];
