@@ -341,11 +341,10 @@ private:
     bool _isDisposed{false};
     Status _killStatus = Status::OK();
 
-    // unique_ptr (8B) not optional<BSONObj> (24B): extra bytes pushed clustered-_id
-    // PlanExecutorExpress out of tcmalloc's 576 class into 640.
+    // unique_ptr not optional: keeps clustered-_id executors in the 576-byte size class.
     std::unique_ptr<BSONObj> _stash;
 
-    // Empty on point-lookup instantiations so this does not grow those executors.
+    // Empty when !canIterate(), so point-lookup executors do not grow.
     struct LimitState {
         boost::optional<long long> limit;
         long long returned{0};
@@ -359,7 +358,6 @@ private:
         }
         return false;
     }
-
 
     PlanExplainerExpress _planExplainer;
     std::vector<NamespaceStringOrUUID> _secondaryNss;
@@ -427,7 +425,6 @@ PlanExecutor::ExecState PlanExecutorExpress<Plan>::getNext(BSONObj* out, RecordI
             return ExecState::IS_EOF;
         }
 
-        // Stash is inside the timer / fail-point / interrupt scope.
         if (_stash) {
             _opCtx->checkForInterrupt();
             uassertStatusOK(_killStatus);

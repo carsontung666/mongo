@@ -104,10 +104,7 @@ boost::optional<PrefixScanTarget> getIndexForExpressPrefixScan(
     if (!collection || collection->getClusteredInfo()) {
         return boost::none;
     }
-    // An orphan rejected by the shard filter yields no document, so the batch size stops
-    // bounding how many keys a single getNext() walks. Leaving shard filtering out keeps the
-    // scan bounded without a yield point, matching the limit getIndexForExpressEquality puts
-    // on non-unique indexes (TODO SERVER-87016).
+    // Rejected orphans produce no document, so getNext() would walk the whole run.
     if (params.mainCollectionInfo.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
         return boost::none;
     }

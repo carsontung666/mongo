@@ -251,7 +251,6 @@ void temporarilyYieldCollection(OperationContext* opCtx,
     restoreTransactionResourcesToOperationContext(opCtx, std::move(yieldedTransactionResources));
 }
 
-// Index catalog entry by ident.
 inline const IndexCatalogEntry* getIndexCatalogEntryForUserIndex(OperationContext* opCtx,
                                                                  const Collection& collection,
                                                                  const std::string& indexIdent,
@@ -931,7 +930,7 @@ public:
     void temporarilyReleaseResourcesAndYield(OperationContext* opCtx,
                                              Callable whileYieldedCallback) {
         const auto& collection = unwrapCollection(_collection);
-        // Read nss before the yield; the acquisition afterwards would compare it to itself.
+        // Read nss before unlocking; the acquisition afterwards would compare it to itself.
         const NamespaceString nss = accessCollection(collection).ns();
         releaseResources();
         temporarilyYieldCollection(opCtx, collection, std::move(whileYieldedCallback));
