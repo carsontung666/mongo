@@ -104,6 +104,13 @@ boost::optional<PrefixScanTarget> getIndexForExpressPrefixScan(
     if (!collection || collection->getClusteredInfo()) {
         return boost::none;
     }
+    // An orphan rejected by the shard filter yields no document, so the batch size stops
+    // bounding how many keys a single getNext() walks. Leaving shard filtering out keeps the
+    // scan bounded without a yield point, matching the limit getIndexForExpressEquality puts
+    // on non-unique indexes (TODO SERVER-87016).
+    if (params.mainCollectionInfo.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
+        return boost::none;
+    }
     // tryExpress() runs before planning; a distinct would lose DISTINCT_SCAN.
     if (cq.getDistinct()) {
         return boost::none;
@@ -336,7 +343,7 @@ ExpressResult tryExpress(OperationContext* opCtx,
             collections.getMainCollectionPtrOrAcquisition(),
             *target->index,
             std::move(target->prefixValues),
-            getScopedCollectionFilter(opCtx, collections, *paramsForSingleCollectionQuery),
+            boost::none /* collectionFilter, refused above */,
             plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA);
         return {.executor = std::move(expressExecutor)};
     }
