@@ -40,6 +40,7 @@
 #include "mongo/db/update/update_util.h"
 #include "mongo/util/modules.h"
 
+#include <span>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -248,6 +249,55 @@ void temporarilyYieldCollection(OperationContext* opCtx,
     yieldFailedScopeGuard.dismiss();
 
     restoreTransactionResourcesToOperationContext(opCtx, std::move(yieldedTransactionResources));
+}
+
+inline const IndexCatalogEntry* getIndexCatalogEntryForUserIndex(OperationContext* opCtx,
+                                                                 const Collection& collection,
+                                                                 const std::string& indexIdent,
+                                                                 const std::string& indexName) {
+    const auto entry = collection.getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
+    uassert(ErrorCodes::QueryPlanKilled,
+            fmt::format("query plan killed :: index {} dropped", indexName),
+            entry);
+    return entry;
+}
+
+// Bounds for keys sharing 'prefixValues'; remaining fields are open in index order.
+inline std::pair<BSONObj, BSONObj> buildEqualityPrefixBounds(
+    const IndexDescriptor* desc,
+    std::span<const BSONElement> prefixValues,
+    const CollatorInterface* collator) {
+    BSONObjBuilder startBob, endBob;
+    for (const auto& value : prefixValues) {
+        CollationIndexKey::collationAwareIndexKeyAppend(value, collator, &startBob);
+        CollationIndexKey::collationAwareIndexKeyAppend(value, collator, &endBob);
+    }
+    for (int i = static_cast<int>(prefixValues.size()); i < desc->getNumFields(); ++i) {
+        if (desc->ordering().get(i) == 1) {
+            startBob.appendMinKey("");
+            endBob.appendMaxKey("");
+        } else {
+            startBob.appendMaxKey("");
+            endBob.appendMinKey("");
+        }
+    }
+    return {startBob.obj(), endBob.obj()};
+}
+
+inline void logRecordNotFoundForIndexKey(OperationContext* opCtx,
+                                         const IndexCatalogEntry* indexCatalogEntry,
+                                         const SortedDataKeyValueView& keyEntry,
+                                         const NamespaceString& nss) {
+    const auto& keyPattern = indexCatalogEntry->descriptor()->keyPattern();
+    auto dehydratedKp = key_string::toBson(keyEntry.getKeyStringWithoutRecordIdView(),
+                                           Ordering::make(keyPattern),
+                                           keyEntry.getTypeBitsView(),
+                                           keyEntry.getVersion());
+    logRecordNotFound(opCtx,
+                      *keyEntry.getRecordId(),
+                      IndexKeyEntry::rehydrateKey(keyPattern, dehydratedKp),
+                      keyPattern,
+                      nss);
 }
 
 /**
@@ -647,7 +697,7 @@ public:
               CollectionAcquisition collection,
               bool forWrite,
               IteratorStats* stats) {
-        _indexCatalogEntry = LookupViaUserIndex::getIndexCatalogEntryForUserIndex(
+        _indexCatalogEntry = getIndexCatalogEntryForUserIndex(
             opCtx, accessCollection(collection), _indexIdent, _indexName);
         _collection = std::move(collection);
         _collectionUUID = accessCollection(unwrapCollection(_collection)).uuid();
@@ -670,23 +720,8 @@ public:
             return Exhausted();
         }
 
-        // Build the start and end bounds for the equality by appending a fully-open bound for each
-        // remaining field in the compound index.
-        BSONObjBuilder startBob, endBob;
-        CollationIndexKey::collationAwareIndexKeyAppend(_filterValue, _collator, &startBob);
-        CollationIndexKey::collationAwareIndexKeyAppend(_filterValue, _collator, &endBob);
-        auto desc = _indexCatalogEntry->descriptor();
-        for (int i = 1; i < desc->getNumFields(); ++i) {
-            if (desc->ordering().get(i) == 1) {
-                startBob.appendMinKey("");
-                endBob.appendMaxKey("");
-            } else {
-                startBob.appendMaxKey("");
-                endBob.appendMinKey("");
-            }
-        }
-        auto startKey = startBob.obj();
-        auto endKey = endBob.obj();
+        auto [startKey, endKey] = buildEqualityPrefixBounds(
+            _indexCatalogEntry->descriptor(), std::span{&_filterValue, 1}, _collator);
 
         // Now seek to the first matching key in the index.
         auto sortedAccessMethod = _indexCatalogEntry->accessMethod()->asSortedData();
@@ -713,17 +748,8 @@ public:
         bool found = FetchCallback{}(
             opCtx, collection, _indexCatalogEntry, keyEntry, _projection, obj, _stats);
         if (!found) {
-            const auto& keyPattern = _indexCatalogEntry->descriptor()->keyPattern();
-            auto dehydratedKp = key_string::toBson(keyEntry.getKeyStringWithoutRecordIdView(),
-                                                   Ordering::make(keyPattern),
-                                                   keyEntry.getTypeBitsView(),
-                                                   keyEntry.getVersion());
-
-            logRecordNotFound(opCtx,
-                              *keyEntry.getRecordId(),
-                              IndexKeyEntry::rehydrateKey(keyPattern, dehydratedKp),
-                              keyPattern,
-                              accessCollection(collection).ns());
+            logRecordNotFoundForIndexKey(
+                opCtx, _indexCatalogEntry, keyEntry, accessCollection(collection).ns());
             return Ready();
         }
 
@@ -759,7 +785,7 @@ public:
                 "the catalog was closed and reopened",
                 CollectionCatalog::get(opCtx)->getEpoch() == _catalogEpoch);
         const auto& coll = unwrapCollection(_collection);
-        _indexCatalogEntry = LookupViaUserIndex::getIndexCatalogEntryForUserIndex(
+        _indexCatalogEntry = getIndexCatalogEntryForUserIndex(
             opCtx, accessCollection(coll), _indexIdent, _indexName);
     }
 
@@ -774,19 +800,6 @@ public:
     }
 
 private:
-    static const IndexCatalogEntry* getIndexCatalogEntryForUserIndex(OperationContext* opCtx,
-                                                                     const Collection& collection,
-                                                                     const std::string& indexIdent,
-                                                                     const std::string& indexName) {
-        const IndexCatalog* catalog = collection.getIndexCatalog();
-        const auto entry = catalog->findIndexByIdent(opCtx, indexIdent);
-        uassert(ErrorCodes::QueryPlanKilled,
-                fmt::format("query plan killed :: index {} dropped", indexName),
-                entry);
-
-        return entry;
-    }
-
     BSONElement _filterValue;  // Unowned BSON.
     const std::string _indexIdent;
     const std::string _indexName;
@@ -798,6 +811,167 @@ private:
 
     const CollatorInterface* _collator;             // Owned by the query's ExpressionContext.
     const projection_ast::Projection* _projection;  // Owned by the CanonicalQuery.
+
+    bool _exhausted{false};
+
+    IteratorStats* _stats{nullptr};
+};
+
+// Walks the run of keys sharing an equality prefix. Save/restore must keep the RecordId.
+template <class FetchCallback>
+class PrefixScanViaUserIndex {
+public:
+    static constexpr bool kCanIterate = true;
+
+    PrefixScanViaUserIndex(std::vector<BSONElement> prefixValues,
+                           std::string indexIdent,
+                           std::string indexName,
+                           const CollatorInterface* collator,
+                           const projection_ast::Projection* projection)
+        : _prefixValues(std::move(prefixValues)),
+          _indexIdent(std::move(indexIdent)),
+          _indexName(std::move(indexName)),
+          _collator(collator),
+          _projection(projection) {}
+
+    void open(OperationContext* opCtx,
+              CollectionAcquisition collection,
+              bool forWrite,
+              IteratorStats* stats) {
+        _indexCatalogEntry = getIndexCatalogEntryForUserIndex(
+            opCtx, accessCollection(collection), _indexIdent, _indexName);
+        _collection = std::move(collection);
+        _collectionUUID = accessCollection(unwrapCollection(_collection)).uuid();
+        _catalogEpoch = CollectionCatalog::get(opCtx)->getEpoch();
+
+        _stats = stats;
+        _stats->setStageName("EXPRESS_PREFIX_IXSCAN"sv);
+        _stats->setIndexName(_indexName);
+        _stats->setIndexKeyPattern(_indexCatalogEntry->descriptor()->keyPattern());
+    }
+
+    template <class Continuation>
+    PlanProgress consumeOne(OperationContext* opCtx, Continuation continuation) {
+        if (_exhausted) {
+            return Exhausted();
+        }
+
+        const auto& collection = unwrapCollection(_collection);
+        auto sortedAccessMethod = _indexCatalogEntry->accessMethod()->asSortedData();
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+
+        auto keyEntry = _cursor ? _cursor->nextKeyValueView(ru)
+                                : openCursorAndSeek(opCtx, ru, sortedAccessMethod);
+
+        if (keyEntry.isEmpty()) {
+            _exhausted = true;
+            return Exhausted();
+        }
+        _stats->incNumKeysExamined(1);
+
+        Snapshotted<BSONObj> obj;
+        bool found = FetchCallback{}(
+            opCtx, collection, _indexCatalogEntry, keyEntry, _projection, obj, _stats);
+
+        if (!found) {
+            logRecordNotFoundForIndexKey(
+                opCtx, _indexCatalogEntry, keyEntry, accessCollection(collection).ns());
+            return Ready();
+        }
+
+        continuation(collection, *keyEntry.getRecordId(), std::move(obj), nullptr /*cursor*/);
+        return Ready();
+    }
+
+    bool exhausted() const {
+        return _exhausted;
+    }
+
+    void releaseResources() {
+        if (_cursor) {
+            _cursor->save();
+        }
+        _indexCatalogEntry = nullptr;
+    }
+
+    void restoreResources(OperationContext* opCtx,
+                          const CollectionPtr* collection,
+                          const NamespaceString& nss) {
+        restoreInvalidatedCollection(opCtx, _collection, collection, *_collectionUUID, nss);
+        uassert(ErrorCodes::QueryPlanKilled,
+                "the catalog was closed and reopened",
+                CollectionCatalog::get(opCtx)->getEpoch() == _catalogEpoch);
+        const auto& coll = unwrapCollection(_collection);
+        _indexCatalogEntry = getIndexCatalogEntryForUserIndex(
+            opCtx, accessCollection(coll), _indexIdent, _indexName);
+        // Kill the plan if the index became multikey while parked.
+        if (_indexCatalogEntry->isMultikey(opCtx, accessCollectionPtr(coll))) {
+            uasserted(ErrorCodes::QueryPlanKilled,
+                      "the index became multikey while the query was parked");
+        }
+        if (_cursor) {
+            _cursor->restore(*shard_role_details::getRecoveryUnit(opCtx));
+        }
+    }
+
+    void detachFromOperationContext() {
+        if (_cursor) {
+            _cursor->detachFromOperationContext();
+        }
+    }
+
+    void reattachToOperationContext(OperationContext* opCtx) {
+        if (_cursor) {
+            _cursor->reattachToOperationContext(opCtx);
+        }
+    }
+
+    template <class Callable>
+    void temporarilyReleaseResourcesAndYield(OperationContext* opCtx,
+                                             Callable whileYieldedCallback) {
+        const auto& collection = unwrapCollection(_collection);
+        // Read nss before unlocking; the acquisition afterwards would compare it to itself.
+        const NamespaceString nss = accessCollection(collection).ns();
+        releaseResources();
+        temporarilyYieldCollection(opCtx, collection, std::move(whileYieldedCallback));
+        restoreResources(opCtx, &accessCollectionPtr(collection), nss);
+    }
+
+private:
+    SortedDataKeyValueView openCursorAndSeek(
+        OperationContext* opCtx,
+        RecoveryUnit& ru,
+        const SortedDataIndexAccessMethod* sortedAccessMethod) {
+        auto [startKey, endKey] =
+            buildEqualityPrefixBounds(_indexCatalogEntry->descriptor(), _prefixValues, _collator);
+
+        _cursor = sortedAccessMethod->newCursor(opCtx, ru, true /* forward */);
+        _cursor->setEndPosition(endKey, true /* endKeyInclusive */);
+
+        key_string::Builder builder(
+            sortedAccessMethod->getSortedDataInterface()->getKeyStringVersion());
+        auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            startKey,
+            sortedAccessMethod->getSortedDataInterface()->getOrdering(),
+            true /* forward */,
+            true /* startKeyInclusive */,
+            builder);
+        return _cursor->seekForKeyValueView(ru, keyStringForSeek);
+    }
+
+    std::vector<BSONElement> _prefixValues;  // Unowned BSON, owned by the CanonicalQuery.
+    const std::string _indexIdent;
+    const std::string _indexName;
+
+    typename WrapInOptionalIfNeeded<CollectionAcquisition>::type _collection{};
+    boost::optional<UUID> _collectionUUID;
+    uint64_t _catalogEpoch{0};
+    const IndexCatalogEntry* _indexCatalogEntry{nullptr};  // Unowned.
+
+    const CollatorInterface* _collator;             // Owned by the query's ExpressionContext.
+    const projection_ast::Projection* _projection;  // Owned by the CanonicalQuery.
+
+    std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
     bool _exhausted{false};
 
@@ -1173,6 +1347,10 @@ public:
 
     template <class Continuation>
     PlanProgress proceed(OperationContext* opCtx, Continuation continuation) {
+        if constexpr (canIterate()) {
+            static_assert(std::is_same_v<WriteOperationChoice, NoWriteOperation>,
+                          "iterating express plans are read-only");
+        }
         return _iterator.consumeOne(
             opCtx,
             [&](const auto& collection,
@@ -1213,6 +1391,25 @@ public:
     void releaseResources() {
         _iterator.releaseResources();
         releaseShardFilterResources(_shardFilter);
+    }
+
+    static constexpr bool canIterate() {
+        if constexpr (requires { IteratorChoice::kCanIterate; }) {
+            return IteratorChoice::kCanIterate;
+        }
+        return false;
+    }
+
+    void detachFromOperationContext() {
+        if constexpr (requires { _iterator.detachFromOperationContext(); }) {
+            _iterator.detachFromOperationContext();
+        }
+    }
+
+    void reattachToOperationContext(OperationContext* opCtx) {
+        if constexpr (requires { _iterator.reattachToOperationContext(opCtx); }) {
+            _iterator.reattachToOperationContext(opCtx);
+        }
     }
 
     void restoreResources(OperationContext* opCtx,
