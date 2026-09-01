@@ -28,6 +28,7 @@
 #include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_utils.h"
 #include "mongo/db/query/write_conflict_backoff.h"
 #include "mongo/db/query/write_conflict_storm.h"
 #include "mongo/db/query/write_ops/canonical_delete.h"
@@ -47,11 +48,15 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 
+#include <algorithm>
+#include <bitset>
+#include <iterator>
 #include <memory>
 #include <string_view>
 #include <utility>
 #include <variant>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/optional/optional.hpp>
 #include <fmt/format.h>
 
@@ -671,7 +676,8 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForFindB
     const IndexForExpressEquality& indexForExpressEquality,
     boost::optional<ScopedCollectionFilter> collectionFilter,
     bool returnOwnedBson) {
-    const auto& [index, coversProjection] = indexForExpressEquality;
+    const auto& index = indexForExpressEquality.index;
+    const bool coversProjection = indexForExpressEquality.coversProjection;
     const auto indexEntry = coll.getCollectionPtr()->getIndexCatalog()->findIndexByName(
         opCtx, index.identifier.catalogName);
     tassert(8884404,
@@ -684,14 +690,14 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForFindB
 
     const CollatorInterface* collator = cq->getCollator();
     const projection_ast::Projection* projection = cq->getProj();
-    auto cmpExpr = dynamic_cast<ComparisonMatchExpressionBase*>(cq->getPrimaryMatchExpression());
-    tassert(10269303, "Invalid match expression", cmpExpr);
-    BSONElement queryFilter = cmpExpr->getData();
+    tassert(10269305,
+            "Express index lookup is missing ordered equality operands",
+            !indexForExpressEquality.orderedEqualities.empty());
 
     const auto expressExecutorFactor = [&]<typename FetchCallback>() {
         return makeExpressExecutor(
             opCtx,
-            express::LookupViaUserIndex<FetchCallback>(queryFilter,
+            express::LookupViaUserIndex<FetchCallback>(indexForExpressEquality.orderedEqualities,
                                                        indexEntry->getIdent(),
                                                        index.identifier.catalogName,
                                                        collator,
@@ -882,15 +888,17 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForDelet
 
 bool canCoverProjection(const IndexEntry& index,
                         const OrderedPathSet& paths,
-                        std::string_view filterPath,
+                        const ExpressEqualityList& equalities,
                         bool collationRelevantForFilter) {
     if (index.multikey && index.multikeyPaths.empty()) {
         return false;
     }
 
     if (index.collator != nullptr) {
-        const bool projectionDependsOnlyOnTheFilter =
-            paths.size() == 1 && paths.contains(filterPath);
+        const bool projectionDependsOnlyOnTheFilter = paths.size() == equalities.size() &&
+            std::all_of(equalities.begin(), equalities.end(), [&](const ExpressEquality& e) {
+                                                          return paths.contains(e.path);
+                                                      });
         if (collationRelevantForFilter || !projectionDependsOnlyOnTheFilter) {
             return false;
         }
@@ -911,30 +919,120 @@ bool canCoverProjection(const IndexEntry& index,
 
     return coveredPaths.size() == paths.size();
 }
-
 bool indexCanSupportExpressPlan(const IndexEntry& index,
                                 const CanonicalQuery& cq,
-                                const BSONElement& comparisonData,
+                                const ExpressEqualityList& equalities,
                                 bool collationRelevant) {
     return index.type == IndexType::INDEX_BTREE &&
         (!collationRelevant ||
          CollatorInterface::collatorsMatch(cq.getCollator(), index.collator)) &&
         // Sparse indexes cannot support comparisons to null.
-        (!index.sparse || !comparisonData.isNull()) &&
+        (!index.sparse ||
+         std::none_of(equalities.begin(),
+                      equalities.end(),
+                      [](const ExpressEquality& e) { return e.data.isNull(); })) &&
         // Partial indexes may not be able to answer the query.
         (!index.filterExpr ||
          expression::isSubsetOf(cq.getPrimaryMatchExpression(), index.filterExpr));
 }
 
-const IndexEntry* findBestIndexEntry(const std::vector<IndexEntry>& indexes,
-                                     const CanonicalQuery& cq,
-                                     const BSONElement& comparisonData,
-                                     const bool collationRelevant) {
+/**
+ * Returns the operands in index key order, or none if the leading fields are not exactly the
+ * constrained paths. The compound-only checks keep single-equality eligibility unchanged.
+ */
+boost::optional<ExpressKeyOperands> orderEqualitiesForIndex(const IndexEntry& index,
+                                                            const ExpressEqualityList& equalities) {
+    const bool isCompound = equalities.size() > 1;
+
+    ExpressKeyOperands ordered;
+    // A repeated key field would otherwise bind one equality twice.
+    std::bitset<Ordering::kMaxCompoundIndexKeys> consumed;
+    size_t keyPatternFieldIndex = 0;
+    for (auto&& elt : index.keyPattern) {
+        if (ordered.size() == equalities.size()) {
+            break;
+        }
+        if (isCompound) {
+            if (!elt.isNumber()) {
+                return boost::none;
+            }
+            if (index.multikey &&
+                (index.multikeyPaths.empty() ||
+                 !index.multikeyPaths[keyPatternFieldIndex].empty())) {
+                return boost::none;
+            }
+        }
+        const std::string_view path = elt.fieldNameStringData();
+        const auto it = std::find_if(equalities.begin(),
+                                     equalities.end(),
+                                     [&](const ExpressEquality& e) { return e.path == path; });
+        if (it == equalities.end()) {
+            return boost::none;
+        }
+        const size_t equalityIndex = static_cast<size_t>(std::distance(equalities.begin(), it));
+        if (consumed.test(equalityIndex)) {
+            return boost::none;
+        }
+        consumed.set(equalityIndex);
+        ordered.push_back(it->data);
+        ++keyPatternFieldIndex;
+    }
+
+    if (ordered.size() != equalities.size()) {
+        return boost::none;
+    }
+    return ordered;
+}
+
+bool indexIsRelevant(const IndexEntry& index, const RelevantFieldIndexMap& fields) {
+    BSONObjIterator it(index.keyPattern);
+    if (!it.more()) {
+        return false;
+    }
+    const std::string fieldName = std::string{it.next().fieldNameStringData()};
+    const auto found = fields.find(fieldName);
+    return found != fields.end() && (!index.sparse || found->second.isSparse);
+}
+
+
+boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
+    const CanonicalQuery& cq,
+    const QueryPlannerParams& plannerParams,
+    const ExpressEqualityList& equalities) {
+    const auto& findCommand = cq.getFindCommandRequest();
+
+    const bool needsShardFilter =
+        plannerParams.mainCollectionInfo.options & QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    const bool hasLimitOne = (findCommand.getLimit() && findCommand.getLimit().get() == 1);
+    const bool collationRelevant =
+        std::any_of(equalities.begin(), equalities.end(), [](const ExpressEquality& e) {
+            return e.data.type() == BSONType::string || e.data.type() == BSONType::object ||
+                e.data.type() == BSONType::array;
+        });
+
+    RelevantFieldIndexMap fields;
+    QueryPlannerIXSelect::getFields(cq.getPrimaryMatchExpression(), &fields);
+    const auto& indexes = plannerParams.mainCollectionInfo.indexes;
+
+    const OrderedPathSet* dependencies = nullptr;
+    if (cq.getProj() && cq.getProj()->type() == projection_ast::ProjectType::kInclusion) {
+        dependencies = &cq.getProj()->getRequiredFields();
+    }
+
     int fewestIdxKeys = Ordering::kMaxCompoundIndexKeys + 1;
     const IndexEntry* bestEntry = nullptr;
+    ExpressKeyOperands bestOrdered;
+    int fewestCoveringIdxKeys = Ordering::kMaxCompoundIndexKeys + 1;
+    const IndexEntry* bestCoveringEntry = nullptr;
+    ExpressKeyOperands bestCoveringOrdered;
 
     for (const auto& e : indexes) {
-        if (!indexCanSupportExpressPlan(e, cq, comparisonData, collationRelevant)) {
+        if (!indexIsRelevant(e, fields) ||
+            !indexCanSupportExpressPlan(e, cq, equalities, collationRelevant)) {
+            continue;
+        }
+        auto ordered = orderEqualitiesForIndex(e, equalities);
+        if (!ordered) {
             continue;
         }
 
@@ -943,74 +1041,29 @@ const IndexEntry* findBestIndexEntry(const std::vector<IndexEntry>& indexes,
         if (fewestIdxKeys > nIdxKeys ||
             (fewestIdxKeys == nIdxKeys && e.unique && !bestEntry->unique)) {
             bestEntry = &e;
+            bestOrdered = *ordered;
             fewestIdxKeys = nIdxKeys;
         }
-    }
-    return bestEntry;
-}
-
-const IndexEntry* findBestCoveringIndexEntry(const std::vector<IndexEntry>& indexes,
-                                             const OrderedPathSet& dependencies,
-                                             const CanonicalQuery& cq,
-                                             const BSONElement& comparisonData,
-                                             const bool collationRelevant) {
-    int fewestCoveringIdxKeys = Ordering::kMaxCompoundIndexKeys + 1;
-    const IndexEntry* bestCoveringEntry = nullptr;
-
-    for (const auto& e : indexes) {
-        if (!indexCanSupportExpressPlan(e, cq, comparisonData, collationRelevant)) {
-            continue;
-        }
-
-        const auto nIdxKeys = e.keyPattern.nFields();
-        const bool hasFewestCoveringIdxKeys = fewestCoveringIdxKeys > nIdxKeys;
-
-        if (hasFewestCoveringIdxKeys &&
-            canCoverProjection(
-                e, dependencies, cq.getPrimaryMatchExpression()->path(), collationRelevant)) {
+        if (dependencies && !needsShardFilter && fewestCoveringIdxKeys > nIdxKeys &&
+            canCoverProjection(e, *dependencies, equalities, collationRelevant)) {
             bestCoveringEntry = &e;
+            bestCoveringOrdered = *ordered;
             fewestCoveringIdxKeys = nIdxKeys;
         }
     }
-    return bestCoveringEntry;
-}
-
-boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
-    const CanonicalQuery& cq, const QueryPlannerParams& plannerParams) {
-    const auto& findCommand = cq.getFindCommandRequest();
-
-    const bool needsShardFilter =
-        plannerParams.mainCollectionInfo.options & QueryPlannerParams::INCLUDE_SHARD_FILTER;
-    const bool hasLimitOne = (findCommand.getLimit() && findCommand.getLimit().get() == 1);
-    auto cmpExpr = dynamic_cast<ComparisonMatchExpressionBase*>(cq.getPrimaryMatchExpression());
-    tassert(10269304, "Invalid match expression", cmpExpr);
-    const auto& data = cmpExpr->getData();
-    const bool collationRelevant = data.type() == BSONType::string ||
-        data.type() == BSONType::object || data.type() == BSONType::array;
-
-    RelevantFieldIndexMap fields;
-    QueryPlannerIXSelect::getFields(cq.getPrimaryMatchExpression(), &fields);
-    std::vector<IndexEntry> indexes =
-        QueryPlannerIXSelect::findRelevantIndices(fields, plannerParams.mainCollectionInfo.indexes);
-
-    const OrderedPathSet* dependencies = nullptr;
-    if (cq.getProj() && cq.getProj()->type() == projection_ast::ProjectType::kInclusion) {
-        dependencies = &cq.getProj()->getRequiredFields();
-    }
-
-    const IndexEntry* bestEntry = findBestIndexEntry(indexes, cq, data, collationRelevant);
     if (!bestEntry) {
         return boost::none;
     }
 
     // Eligibility requires one of the following:
-    //   (1) Index is unique and on a single field; or
+    //   (1) Index is unique and every key field is bound; or
     //   (2) No shard filtering needed and query has limit(1).
-    const bool isBestEntryUnique = bestEntry->unique && bestEntry->keyPattern.nFields() == 1;
+    const bool isBestEntryUnique = bestEntry->unique &&
+        static_cast<size_t>(bestEntry->keyPattern.nFields()) == equalities.size();
 
     // TODO SERVER-87016: Support shard filtering for limitOne query with non-unique index.
     // Express executor cannot iterate (yet), so we can only support shard filtering
-    // when there is at most 1 possible result (a unique, single-key index).
+    // when there is at most 1 possible result (a unique, fully bound index).
     const bool isNonUniqueIndexEligible = !needsShardFilter && hasLimitOne;
 
     if (!isBestEntryUnique && !isNonUniqueIndexEligible) {
@@ -1020,15 +1073,12 @@ boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
     // If the query has a finite set of dependencies, we should check if there is an index that can
     // cover the query. If best index is unique, then there is at most 1 matching document in the
     // collection, so any index can be used for express path as long as it covers the predicate.
-    if (dependencies && !needsShardFilter) {
-        // TODO SERVER-108344: Add shard filter fields to dependencies to support shard filtering.
-        if (const auto* bestCoveringEntry =
-                findBestCoveringIndexEntry(indexes, *dependencies, cq, data, collationRelevant)) {
-            return IndexForExpressEquality(std::move(*bestCoveringEntry),
-                                           true /*coversProjection*/);
-        }
+    // TODO SERVER-108344: Add shard filter fields to dependencies to support shard filtering.
+    if (bestCoveringEntry) {
+        return IndexForExpressEquality(
+            *bestCoveringEntry, true /*coversProjection*/, std::move(bestCoveringOrdered));
     }
-    return IndexForExpressEquality(std::move(*bestEntry), false /*coversProjection*/);
+    return IndexForExpressEquality(*bestEntry, false /*coversProjection*/, std::move(bestOrdered));
 }
 
 }  // namespace mongo

@@ -6,12 +6,14 @@
 #include "mongo/db/query/compiler/metadata/index_entry.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_utils.h"
 #include "mongo/db/query/write_ops/canonical_delete.h"
 #include "mongo/db/query/write_ops/canonical_update.h"
 #include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/shard_role/shard_catalog/scoped_collection_metadata.h"
 #include "mongo/util/modules.h"
 
+#include <boost/container/small_vector.hpp>
 #include <boost/optional/optional.hpp>
 
 
@@ -31,13 +33,22 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForFindB
     bool returnOwnedBson);
 
 struct IndexForExpressEquality {
-    IndexForExpressEquality(IndexEntry index, bool coversProjection)
-        : index(std::move(index)), coversProjection(coversProjection) {}
+    IndexForExpressEquality(IndexEntry index,
+                            bool coversProjection,
+                            ExpressKeyOperands orderedEqualities)
+        : index(std::move(index)),
+          coversProjection(coversProjection),
+          orderedEqualities(std::move(orderedEqualities)) {}
 
-    bool operator==(const IndexForExpressEquality& rhs) const = default;
+    // Ignores orderedEqualities: those are cached key operands, not part of index identity.
+    bool operator==(const IndexForExpressEquality& rhs) const {
+        return index == rhs.index && coversProjection == rhs.coversProjection;
+    }
 
     IndexEntry index;
     bool coversProjection;
+    // Equalities in index-key order, filled by getIndexForExpressEquality.
+    ExpressKeyOperands orderedEqualities;
 };
 
 std::ostream& operator<<(std::ostream& stream, const IndexForExpressEquality& i);
@@ -67,7 +78,9 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForDelet
  * index and set coversProjection flag to true.
  */
 boost::optional<IndexForExpressEquality> getIndexForExpressEquality(
-    const CanonicalQuery& cq, const QueryPlannerParams& plannerParams);
+    const CanonicalQuery& cq,
+    const QueryPlannerParams& plannerParams,
+    const ExpressEqualityList& equalities);
 
 inline BSONObj getQueryFilterMaybeUnwrapEq(const BSONObj& query) {
     // We allow queries of the shape {_id: {$eq: <value>}} to use the express path, but we

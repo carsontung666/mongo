@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/ordering.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/compiler/logical_model/sort_pattern/sort_pattern.h"
@@ -14,6 +16,10 @@
 #include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/util/modules.h"
+
+#include <string_view>
+
+#include <boost/container/small_vector.hpp>
 
 namespace mongo {
 /**
@@ -56,30 +62,102 @@ inline bool isIdHackEligibleQuery(const CollectionPtr& collection, const Canonic
 }
 
 /**
- * Returns 'true' if 'query' on the given 'collection' can be answered using a special IXSCAN +
- * FETCH plan. Among other restrictions, the query must be a single-field equality generating exact
- * bounds.
+ * One equality operand of an express-eligible predicate, together with the path it constrains.
  */
-inline bool isEqualityExpressEligibleQuery(const CollectionPtr& collection,
-                                           const CanonicalQuery& cq) {
+struct ExpressEquality {
+    std::string_view path;
+    BSONElement data;  // Unowned, borrowed from the match expression.
+};
+
+// Held inline: express predicates are short, so decomposing one does not allocate.
+using ExpressEqualityList = boost::container::small_vector<ExpressEquality, 4>;
+// Equality operands in index-key order, borrowed from the match expression.
+using ExpressKeyOperands = boost::container::small_vector<BSONElement, 4>;
+
+/**
+ * Decomposes 'me' into equalities and returns 'true' for a single equality, or a conjunction of
+ * equalities on distinct paths, all generating exact bounds. 'out' is unspecified when 'false'.
+ */
+inline bool collectExpressEqualities(const MatchExpression* me, ExpressEqualityList* out) {
+    const auto addOne = [&](const MatchExpression* node) {
+        if (node->matchType() != MatchExpression::EQ) {
+            return false;
+        }
+        const auto* cmp = static_cast<const ComparisonMatchExpressionBase*>(node);
+        if (!Indexability::isExactBoundsGenerating(cmp->getData())) {
+            return false;
+        }
+        if (out->size() >= static_cast<size_t>(Ordering::kMaxCompoundIndexKeys)) {
+            return false;
+        }
+        out->push_back(ExpressEquality{node->path(), cmp->getData()});
+        return true;
+    };
+
+    // Accept nested $and so eligibility does not depend on CanonicalQuery's flattening.
+    const auto collectFrom = [&](auto&& self, const MatchExpression* node) -> bool {
+        if (node->matchType() == MatchExpression::AND) {
+            if (node->numChildren() == 0) {
+                return false;
+            }
+            for (size_t i = 0; i < node->numChildren(); ++i) {
+                if (!self(self, node->getChild(i))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return addOne(node);
+    };
+
+    out->clear();
+    if (!collectFrom(collectFrom, me) || out->empty()) {
+        return false;
+    }
+    // Two equalities on one path are redundant or contradictory; leave them to the planner.
+    for (size_t i = 1; i < out->size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if ((*out)[i].path == (*out)[j].path) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * Returns 'true' if 'query' can be answered using the user-index express path, subject to finding
+ * a suitable index.
+ */
+inline bool isEqualityExpressEligibleQuery(const CanonicalQuery& cq,
+                                           ExpressEqualityList* equalitiesOut = nullptr) {
     const auto& findCommand = cq.getFindCommandRequest();
     auto me = cq.getPrimaryMatchExpression();
 
-    if (cq.getExpCtx()->getQueryKnobConfiguration().getDisableSingleFieldExpressExecutor()) {
+    const bool isProjectionEligible = cq.getProj() == nullptr || cq.getProj()->isSimple();
+
+    if (!isProjectionEligible || findCommand.getShowRecordId() ||
+        !findCommand.getHint().isEmpty() || !findCommand.getMin().isEmpty() ||
+        !findCommand.getMax().isEmpty() || !findCommand.getSort().isEmpty() ||
+        findCommand.getSkip() || findCommand.getTailable()) {
         return false;
     }
 
-    const bool isProjectionEligible = cq.getProj() == nullptr || cq.getProj()->isSimple();
-
-    return
-        // Properties of the find command.
-        isProjectionEligible && !findCommand.getShowRecordId() && findCommand.getHint().isEmpty() &&
-        findCommand.getMin().isEmpty() && findCommand.getMax().isEmpty() &&
-        findCommand.getSort().isEmpty() && !findCommand.getSkip() && !findCommand.getTailable() &&
-        // Properties of the query's match expression.
-        me->matchType() == MatchExpression::EQ &&
-        Indexability::isExactBoundsGenerating(
-            static_cast<ComparisonMatchExpressionBase*>(me)->getData());
+    ExpressEqualityList local;
+    ExpressEqualityList* out = equalitiesOut ? equalitiesOut : &local;
+    if (!collectExpressEqualities(me, out)) {
+        return false;
+    }
+    const auto& knobs = cq.getExpCtx()->getQueryKnobConfiguration();
+    if (out->size() == 1 && knobs.getDisableSingleFieldExpressExecutor()) {
+        return false;
+    }
+    if (out->size() > 1 &&
+        (!feature_flags::gFeatureFlagExpressCompoundEquality.isEnabled() ||
+         knobs.getDisableCompoundFieldExpressExecutor())) {
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -96,7 +174,8 @@ enum ExpressEligibility {
 };
 inline ExpressEligibility isExpressEligible(OperationContext* opCtx,
                                             const CollectionPtr& coll,
-                                            const CanonicalQuery& cq) {
+                                            const CanonicalQuery& cq,
+                                            ExpressEqualityList* equalities = nullptr) {
     // Not eligible to use the express path if a particular query framework is set.
     if (auto queryFramework = cq.getExpCtx()->getQuerySettings().getQueryFramework()) {
         return ExpressEligibility::Ineligible;
@@ -119,8 +198,8 @@ inline ExpressEligibility isExpressEligible(OperationContext* opCtx,
         return ExpressEligibility::IdPointQueryEligible;
     }
 
-    if (isEqualityExpressEligibleQuery(coll, cq) && coll->getIndexCatalog()->haveAnyIndexes() &&
-        !coll->getClusteredInfo()) {
+    if (isEqualityExpressEligibleQuery(cq, equalities) &&
+        coll->getIndexCatalog()->haveAnyIndexes() && !coll->getClusteredInfo()) {
         return ExpressEligibility::IndexedEqualityEligible;
     }
 

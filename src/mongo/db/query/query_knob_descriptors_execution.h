@@ -81,6 +81,10 @@
          kInternalQueryDisableSingleFieldExpressExecutorName,                             \
          internalQueryDisableSingleFieldExpressExecutor,                                  \
          getDisableSingleFieldExpressExecutor)                                            \
+    KNOB(kDisableCompoundFieldExpressExecutor,                                            \
+         kInternalQueryDisableCompoundFieldExpressExecutorName,                           \
+         internalQueryDisableCompoundFieldExpressExecutor,                                \
+         getDisableCompoundFieldExpressExecutor)                                          \
     KNOB(kChangeStreamUpdateLookupMaxBatchSize,                                           \
          kInternalChangeStreamUpdateLookupMaxBatchSizeName,                               \
          internalChangeStreamUpdateLookupMaxBatchSize,                                    \

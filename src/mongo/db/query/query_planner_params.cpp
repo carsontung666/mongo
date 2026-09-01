@@ -23,6 +23,8 @@
 #include "mongo/s/query/shard_targeting_collation_helpers.h"
 #include "mongo/util/assert_util.h"
 
+#include <algorithm>
+
 #include <boost/optional/optional.hpp>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
@@ -581,6 +583,76 @@ void QueryPlannerParams::fillOutMainCollectionPlannerParams(
 
     fillOutPlannerCollectionInfo(
         opCtx, mainColl, &mainCollectionInfo.stats, false /* includeSizeStats */);
+}
+
+void QueryPlannerParams::fillOutIndexEntriesForExpressEquality(
+    OperationContext* opCtx,
+    const CanonicalQuery& canonicalQuery,
+    const MultipleCollectionAccessor& collections,
+    const ExpressEqualityList& equalities) {
+    const auto& mainColl = collections.getMainCollection();
+    if (!mainColl) {
+        return;
+    }
+
+    // _id queries skip the catalog in fillOutMainCollectionPlannerParams, so there are no
+    // candidate indexes to build here either.
+    if (isIdHackEligibleQuery(mainColl, canonicalQuery) && !alwaysFillOutCollectionInfo) {
+        return;
+    }
+
+    const auto& findCommand = canonicalQuery.getFindCommandRequest();
+    const bool hasLimitOne = findCommand.getLimit() && findCommand.getLimit().get() == 1;
+
+    // Over-permissive pre-filter for getIndexForExpressEquality's unique-or-limit-1 rule: it
+    // only inspects the leading field, so it never rejects an index that rule would accept.
+    std::vector<std::shared_ptr<const IndexCatalogEntry>> candidates;
+    bool anyFullyBoundUnique = false;
+
+    const bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
+    for (auto&& ice :
+         mainColl->getIndexCatalog()->getEntriesShared(IndexCatalog::InclusionPolicy::kReady)) {
+        const auto* descriptor = ice->descriptor();
+        const auto indexType = descriptor->getIndexType();
+        if (apiStrict &&
+            (indexType == IndexType::INDEX_HAYSTACK || indexType == IndexType::INDEX_TEXT ||
+             descriptor->isSetSparseByUser())) {
+            continue;
+        }
+        if (descriptor->hidden()) {
+            continue;
+        }
+
+        BSONObjIterator keyIt(descriptor->keyPattern());
+        if (!keyIt.more()) {
+            continue;
+        }
+        const std::string_view leading = keyIt.next().fieldNameStringData();
+        const auto bound =
+            std::find_if(equalities.begin(), equalities.end(), [&](const ExpressEquality& e) {
+                return e.path == leading;
+            });
+        if (bound == equalities.end()) {
+            continue;
+        }
+
+        anyFullyBoundUnique = anyFullyBoundUnique ||
+            (descriptor->unique() &&
+             static_cast<size_t>(descriptor->keyPattern().nFields()) == equalities.size());
+
+        candidates.emplace_back(std::move(ice));
+    }
+
+    if (candidates.empty() || (!anyFullyBoundUnique && !hasLimitOne)) {
+        return;
+    }
+
+    for (auto&& ice : candidates) {
+        mainCollectionInfo.indexes.emplace_back(
+            indexEntryFromIndexCatalogEntry(opCtx, mainColl, std::move(ice), canonicalQuery));
+    }
+
+    applyQuerySettingsOrIndexFiltersForMainCollection(canonicalQuery, collections);
 }
 
 void QueryPlannerParams::setTargetSbeStageBuilder(const CanonicalQuery& canonicalQuery,

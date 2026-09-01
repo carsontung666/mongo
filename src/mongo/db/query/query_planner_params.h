@@ -18,6 +18,7 @@
 #include "mongo/db/query/query_integration_knobs_gen.h"
 #include "mongo/db/query/query_knobs/query_knob_configuration.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/query/query_utils.h"
 #include "mongo/db/shard_role/shard_catalog/clustered_collection_options_gen.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/util/modules.h"
@@ -271,6 +272,14 @@ struct [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlannerParams {
         fillOutPlannerParamsForExpressQuery(
             args.opCtx, args.canonicalQuery, args.collections.getMainCollection());
     }
+
+    /**
+     * Index entries for the express equality path only.
+     */
+    void fillOutIndexEntriesForExpressEquality(OperationContext* opCtx,
+                                               const CanonicalQuery& canonicalQuery,
+                                               const MultipleCollectionAccessor& collections,
+                                               const ExpressEqualityList& equalities);
 
     /**
      * Initializes query planner parameters by filling in main collection info and fetching main

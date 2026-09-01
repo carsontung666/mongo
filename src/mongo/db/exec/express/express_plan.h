@@ -19,6 +19,7 @@
 #include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
 #include "mongo/db/query/plan_explainer_express.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_utils.h"
 #include "mongo/db/query/write_ops/update_request.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/record_id_helpers.h"
@@ -45,6 +46,7 @@
 #include <utility>
 #include <variant>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/optional/optional.hpp>
 #include <fmt/format.h>
 
@@ -623,21 +625,21 @@ struct FetchFromCollectionCallback {
 
 /**
  * A document iterator that uses an arbitrary index to iterate over documents in a collection that
- * match a simple equality predicate on the first field in the index key pattern. There is no
- * uniqueness requirement for the queried field, and this iterator can produce multiple matching
- * documents.
+ * match equalities on the leading index fields, in key order. There is no uniqueness requirement
+ * for the queried fields, and this iterator can produce multiple matching documents.
  *
  * The iterator owns the resources associated with the collection it iterates.
  */
 template <class FetchCallback>
 class LookupViaUserIndex {
 public:
-    LookupViaUserIndex(const BSONElement& filterValue,
+    // One equality operand per leading index field, in key order.
+    LookupViaUserIndex(ExpressKeyOperands filterValues,
                        std::string indexIdent,
                        std::string indexName,
                        const CollatorInterface* collator,
                        const projection_ast::Projection* projection)
-        : _filterValue(filterValue),
+        : _filterValues(std::move(filterValues)),
           _indexIdent(std::move(indexIdent)),
           _indexName(std::move(indexName)),
           _collator(collator),
@@ -670,13 +672,18 @@ public:
             return Exhausted();
         }
 
-        // Build the start and end bounds for the equality by appending a fully-open bound for each
-        // remaining field in the compound index.
+        // Append the bound equalities in key order, then a fully-open bound for each remaining
+        // field.
         BSONObjBuilder startBob, endBob;
-        CollationIndexKey::collationAwareIndexKeyAppend(_filterValue, _collator, &startBob);
-        CollationIndexKey::collationAwareIndexKeyAppend(_filterValue, _collator, &endBob);
+        for (const auto& filterValue : _filterValues) {
+            CollationIndexKey::collationAwareIndexKeyAppend(filterValue, _collator, &startBob);
+            CollationIndexKey::collationAwareIndexKeyAppend(filterValue, _collator, &endBob);
+        }
         auto desc = _indexCatalogEntry->descriptor();
-        for (int i = 1; i < desc->getNumFields(); ++i) {
+        tassert(10269306,
+                "Express index lookup has more bound equalities than index key fields",
+                static_cast<int>(_filterValues.size()) <= desc->getNumFields());
+        for (int i = static_cast<int>(_filterValues.size()); i < desc->getNumFields(); ++i) {
             if (desc->ordering().get(i) == 1) {
                 startBob.appendMinKey("");
                 endBob.appendMaxKey("");
@@ -787,7 +794,7 @@ private:
         return entry;
     }
 
-    BSONElement _filterValue;  // Unowned BSON.
+    ExpressKeyOperands _filterValues;  // Unowned, key order.
     const std::string _indexIdent;
     const std::string _indexName;
 

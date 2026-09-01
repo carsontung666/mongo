@@ -47,8 +47,7 @@ struct ExpressResult {
 };
 
 /*
- * Builds an express executor if the query is eligible. Otherwise returns the planner params created
- * to check express eligibility, for reuse.
+ * Builds an express executor if the query is eligible. Otherwise returns planner params for reuse.
  */
 ExpressResult tryExpress(OperationContext* opCtx,
                          const MultipleCollectionAccessor& collections,

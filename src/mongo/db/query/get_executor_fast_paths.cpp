@@ -34,6 +34,7 @@
 #include "mongo/db/update/update_driver.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 
 #include <utility>
 
@@ -50,6 +51,7 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
+extern FailPoint pauseAfterFillingOutIndexEntries;
 
 namespace {
 
@@ -77,7 +79,9 @@ ExpressResult tryExpress(OperationContext* opCtx,
                          const MakePlannerParamsFn& makePlannerParams) {
     // First try to use the express id point query fast path.
     const auto& mainColl = collections.getMainCollection();
-    const auto expressEligibility = isExpressEligible(opCtx, mainColl, *canonicalQuery);
+    ExpressEqualityList equalities;
+    const auto expressEligibility =
+        isExpressEligible(opCtx, mainColl, *canonicalQuery, &equalities);
     if (expressEligibility == ExpressEligibility::IdPointQueryEligible) {
         planCacheCounters.incrementClassicSkippedCounter();
         auto plannerParams =
@@ -105,29 +109,30 @@ ExpressResult tryExpress(OperationContext* opCtx,
         return {.executor = std::move(expressExecutor)};
     }
 
-    // The query might still be eligible for express execution via the index equality fast path.
-    // However, that requires the full set of planner parameters for the main collection to be
-    // available and creating those now allows them to be reused for subsequent strategies if
-    // the express index equality one fails.
-    auto paramsForSingleCollectionQuery =
-        makePlannerParams(*canonicalQuery, plannerOptions, boost::none /* replanningData */);
+    // Only the candidate indexes are needed here, not the full planner parameters.
     if (expressEligibility == ExpressEligibility::IndexedEqualityEligible) {
+        QueryPlannerParams expressParams{QueryPlannerParams::ArgsForExpress{
+            opCtx, *canonicalQuery, collections, plannerOptions}};
+        expressParams.fillOutIndexEntriesForExpressEquality(
+            opCtx, *canonicalQuery, collections, equalities);
         if (auto indexEntry =
-                getIndexForExpressEquality(*canonicalQuery, *paramsForSingleCollectionQuery)) {
+                getIndexForExpressEquality(*canonicalQuery, expressParams, equalities)) {
+            // Fires once here; a miss falls through to fillOutIndexEntries, which has its own.
+            pauseAfterFillingOutIndexEntries.pauseWhileSet();
             auto expressExecutor = makeExpressExecutorForFindByUserIndex(
                 opCtx,
                 std::move(canonicalQuery),
                 collections.getMainCollectionPtrOrAcquisition(),
                 *indexEntry,
-                getScopedCollectionFilter(opCtx, collections, *paramsForSingleCollectionQuery),
+                getScopedCollectionFilter(opCtx, collections, expressParams),
                 plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA);
 
             return {.executor = std::move(expressExecutor)};
         }
     }
 
-    // Allow reuse of the planner params, in case other planning logic needs it.
-    return {.plannerParams = std::move(paramsForSingleCollectionQuery)};
+    return {.plannerParams = makePlannerParams(
+                *canonicalQuery, plannerOptions, boost::none /* replanningData */)};
 }
 
 std::unique_ptr<classic_runtime_planner::IdHackPlanner> tryIdHack(
