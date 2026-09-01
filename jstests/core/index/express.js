@@ -22,6 +22,7 @@
  * ]
  */
 
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 import {
     getPlanStage,
@@ -392,3 +393,114 @@ runWithParamsAllNodes(
         runExpressTest({coll, filter: {_id: 10}, limit: 1, result: [], usesExpress: true});
     },
 );
+
+// A conjunction of equalities can use the express path when a compound index binds every one of
+// them. Previously only a single-field equality was eligible, so these fell through to regular
+// planning.
+if (FeatureFlagUtil.isPresentAndEnabled(db, "ExpressCompoundEquality")) {
+const compoundDocs = [
+    {_id: 100, a: 1, b: 2, c: 3},
+    {_id: 101, a: 1, b: 9, c: 3},
+    {_id: 102, a: 9, b: 2, c: 3},
+];
+recreateCollWith(compoundDocs);
+
+// A unique index whose key is not prefixed by the shard key cannot be created on a sharded
+// collection, so every case below that needs one is guarded the same way the single-field unique
+// cases above are.
+if (!isShardedColl) {
+    // Unique index binding both fields: at most one document can match, so no limit is required.
+    assert.commandWorked(coll.createIndex({a: 1, b: 1}, {unique: true}));
+    runExpressTest({
+        coll,
+        filter: {a: 1, b: 2},
+        result: [{_id: 100, a: 1, b: 2, c: 3}],
+        usesExpress: true,
+    });
+
+    // The order the equalities appear in the predicate is not the order they are bound in; they are
+    // lined up against the index key pattern.
+    runExpressTest({
+        coll,
+        filter: {b: 2, a: 1},
+        result: [{_id: 100, a: 1, b: 2, c: 3}],
+        usesExpress: true,
+    });
+
+    // Binding only the leading field of a unique compound index is not enough without a limit:
+    // uniqueness is over the whole key, so a prefix seek can still match several documents.
+    runExpressTest({
+        coll,
+        filter: {a: 1},
+        result: [
+            {_id: 100, a: 1, b: 2, c: 3},
+            {_id: 101, a: 1, b: 9, c: 3},
+        ],
+        usesExpress: false,
+    });
+
+    // The same prefix seek is eligible again once the caller asks for one document.
+    runExpressTest({
+        coll,
+        filter: {a: 1},
+        limit: 1,
+        result: [{_id: 100, a: 1, b: 2, c: 3}],
+        usesExpress: true,
+    });
+}
+
+// A non-unique compound index cannot bound the result set on its own.
+recreateCollWith(compoundDocs);
+assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+runExpressTest({
+    coll,
+    filter: {a: 1, b: 2},
+    result: [{_id: 100, a: 1, b: 2, c: 3}],
+    usesExpress: false,
+});
+runExpressTest({
+    coll,
+    filter: {a: 1, b: 2},
+    limit: 1,
+    result: [{_id: 100, a: 1, b: 2, c: 3}],
+    usesExpress: !isShardedColl,
+});
+
+if (!isShardedColl) {
+    // A conjunction leaving a leading index field unbound is not a prefix seek: the fields before
+    // the unbound one would return keys the express executor has no way to filter.
+    recreateCollWith(compoundDocs);
+    assert.commandWorked(coll.createIndex({a: 1, b: 1, c: 1}, {unique: true}));
+    runExpressTest({
+        coll,
+        filter: {a: 1, c: 3},
+        result: [
+            {_id: 100, a: 1, b: 2, c: 3},
+            {_id: 101, a: 1, b: 9, c: 3},
+        ],
+        usesExpress: false,
+    });
+
+    // One equality that is not an equality disqualifies the whole conjunction.
+    runExpressTest({
+        coll,
+        filter: {a: 1, b: {$gte: 2}},
+        result: [
+            {_id: 100, a: 1, b: 2, c: 3},
+            {_id: 101, a: 1, b: 9, c: 3},
+        ],
+        usesExpress: false,
+    });
+
+    // A multikey field cannot take the compound path: one document produces several keys, so a seek
+    // is no longer a point lookup.
+    recreateCollWith([{_id: 200, a: [1, 2], b: 2}]);
+    assert.commandWorked(coll.createIndex({a: 1, b: 1}, {unique: true}));
+    runExpressTest({
+        coll,
+        filter: {a: 1, b: 2},
+        result: [{_id: 200, a: [1, 2], b: 2}],
+        usesExpress: false,
+    });
+}
+}  // FeatureFlagUtil.isPresentAndEnabled(ExpressCompoundEquality)

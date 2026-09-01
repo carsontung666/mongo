@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/query/query_bm_fixture.h"
+#include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/util/processinfo.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -10,7 +11,7 @@ namespace mongo {
 namespace {
 
 class PointQueryBenchmark : public QueryBenchmarkFixture {
-private:
+protected:
     BSONObj generateDocument(size_t index, size_t approximateSize) override {
         std::string str;
         str.reserve(approximateSize);
@@ -35,6 +36,27 @@ private:
     }
 };
 
+class CompoundPointQueryBenchmark : public PointQueryBenchmark {
+    BSONObj generateDocument(size_t index, size_t approximateSize) override {
+        BSONObjBuilder bob;
+        bob.appendElements(PointQueryBenchmark::generateDocument(index, approximateSize));
+        bob.append("tenantField", static_cast<long long>(index % 16));
+        bob.append("keyField", static_cast<long long>(index / 16));
+        return bob.obj();
+    }
+
+    std::vector<BSONObj> getIndexSpecs() const override {
+        auto specs = PointQueryBenchmark::getIndexSpecs();
+        specs.push_back(BSONObjBuilder{}
+                            .append("v", IndexConfig::kLatestIndexVersion)
+                            .append("key", BSON("tenantField" << 1 << "keyField" << 1))
+                            .append("name", "tenantField_1_keyField_1")
+                            .append("unique", true)
+                            .obj());
+        return specs;
+    }
+};
+
 BENCHMARK_DEFINE_F(PointQueryBenchmark, IdPointQuery)
 (benchmark::State& state) {
     auto id = docs()[docs().size() / 2].getField("_id").OID();
@@ -45,6 +67,27 @@ BENCHMARK_DEFINE_F(PointQueryBenchmark, UniqueFieldPointQuery)
 (benchmark::State& state) {
     int64_t fieldValue = docs().size() / 2;
     runBenchmark(BSON("uniqueField" << fieldValue), BSONObj{} /*projection*/, state);
+}
+
+BENCHMARK_DEFINE_F(CompoundPointQueryBenchmark, CompoundUniqueFieldPointQuery)
+(benchmark::State& state) {
+    unittest::ServerParameterGuard flag{"featureFlagExpressCompoundEquality", true};
+    const auto& doc = docs()[docs().size() / 2];
+    runBenchmark(BSON("tenantField" << doc.getField("tenantField").numberLong() << "keyField"
+                                    << doc.getField("keyField").numberLong()),
+                 BSONObj{} /*projection*/,
+                 state);
+}
+
+BENCHMARK_DEFINE_F(CompoundPointQueryBenchmark, CompoundUniqueFieldPointQueryExpressDisabled)
+(benchmark::State& state) {
+    unittest::ServerParameterGuard flag{"featureFlagExpressCompoundEquality", true};
+    unittest::ServerParameterGuard knob{"internalQueryDisableCompoundFieldExpressExecutor", true};
+    const auto& doc = docs()[docs().size() / 2];
+    runBenchmark(BSON("tenantField" << doc.getField("tenantField").numberLong() << "keyField"
+                                    << doc.getField("keyField").numberLong()),
+                 BSONObj{} /*projection*/,
+                 state);
 }
 
 BENCHMARK_DEFINE_F(PointQueryBenchmark, NonUniqueFieldPointQuery)
@@ -121,6 +164,10 @@ static void configureProjectionBenchmarks(benchmark::internal::Benchmark* bm) {
 }
 
 BENCHMARK_REGISTER_F(PointQueryBenchmark, IdPointQuery)->Apply(configureBenchmarks);
+BENCHMARK_REGISTER_F(CompoundPointQueryBenchmark, CompoundUniqueFieldPointQuery)
+    ->Apply(configureBenchmarks);
+BENCHMARK_REGISTER_F(CompoundPointQueryBenchmark, CompoundUniqueFieldPointQueryExpressDisabled)
+    ->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, UniqueFieldPointQuery)->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, NonUniqueFieldPointQuery)->Apply(configureBenchmarks);
 BENCHMARK_REGISTER_F(PointQueryBenchmark, ArrayFieldPointQuery)->Apply(configureBenchmarks);

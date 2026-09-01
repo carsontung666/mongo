@@ -954,7 +954,10 @@ mongo_cc_benchmark(
         "point_query_bm.cpp",
     ],
     tags = ["query_bm"],
-    deps = ["query_bm_fixture"],
+    deps = [
+        "query_bm_fixture",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
 )
 
 mongo_cc_benchmark(
