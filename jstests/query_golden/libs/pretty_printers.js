@@ -88,6 +88,7 @@ export function joinPlanToString(stage, indent = 0) {
 
         case "IXSCAN":
         case "EXPRESS_IXSCAN":
+        case "EXPRESS_PREFIX_IXSCAN":
             result += `${stage.stage}: ${stage.nss} ${filter}${stage.indexName} ${JSON.stringify(stage.indexBounds)}\n`;
             break;
         case "INDEX_PROBE_NODE":

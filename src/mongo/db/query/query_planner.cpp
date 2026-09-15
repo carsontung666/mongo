@@ -149,26 +149,6 @@ size_t hashTaggedMatchExpression(MatchExpression* expr, const std::vector<IndexE
 }
 
 /**
- * Returns whether the hint matches the given index. When hinting by index name, 'hintObj' takes the
- * shape of {$hint: <indexName>}. When hinting by key pattern, 'hintObj' represents the actual key
- * pattern (eg: {_id: 1}).
- */
-bool hintMatchesNameOrPattern(const BSONObj& hintObj,
-                              std::string_view indexName,
-                              BSONObj indexKeyPattern) {
-
-    BSONElement firstHintElt = hintObj.firstElement();
-    if (firstHintElt.fieldNameStringData() == "$hint"sv &&
-        firstHintElt.type() == BSONType::string) {
-        // An index name is provided by the hint.
-        return indexName == firstHintElt.valueStringData();
-    }
-
-    // An index spec is provided by the hint.
-    return hintObj.woCompare(indexKeyPattern) == 0;
-}
-
-/**
  * Returns whether the hintedIndex matches the cluster key.
  */
 bool hintMatchesClusterKey(const boost::optional<ClusteredCollectionInfo>& clusteredInfo,

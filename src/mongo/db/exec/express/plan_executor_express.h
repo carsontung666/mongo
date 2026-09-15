@@ -50,6 +50,16 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForFindB
     boost::optional<ScopedCollectionFilter> collectionFilter,
     bool returnOwnedBson);
 
+// Equality-prefix scan. 'prefixValues' are in index-field order.
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForPrefixScan(
+    OperationContext* opCtx,
+    std::unique_ptr<CanonicalQuery> cq,
+    CollectionAcquisition coll,
+    const IndexEntry& index,
+    std::vector<BSONElement> prefixValues,
+    boost::optional<ScopedCollectionFilter> collectionFilter,
+    bool returnOwnedBson);
+
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExpressExecutorForUpdate(
     OperationContext* opCtx,
     CollectionAcquisition collection,
