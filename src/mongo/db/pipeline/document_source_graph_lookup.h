@@ -55,6 +55,15 @@ struct GraphLookUpParams {
     boost::optional<OwnedLiteParsedPipeline>
         fromLpp;  // Always set after construction: the resolved view definition(s) for 'from', or
                   // an empty pipeline for a regular collection.
+
+    // Downstream inclusion $project may only need some fields of each visited document, and may
+    // drop every input field. Fast path honors these; the spilling BFS ignores them unless
+    // the $project was absorbed (see absorbedOutputField).
+    boost::optional<std::vector<std::string>> visitedFieldNames;
+    bool keepInputFields = true;
+    // When a following {$project:{_id:0, out:"$as.field"}} is absorbed, emit `out` as scalars.
+    boost::optional<std::string> absorbedOutputField;
+    boost::optional<std::string> absorbedScalarField;
 };
 
 class DocumentSourceGraphLookUp final : public DocumentSource {
@@ -132,6 +141,11 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         expression::addDependencies(_params.startWith.get(), deps);
+        // Absorbed {$project:{_id:0, out:"$as.field"}} needs no input fields; without
+        // EXHAUSTIVE the cursor would FETCH the whole start document.
+        if (_params.absorbedOutputField) {
+            return DepsTracker::State::EXHAUSTIVE_FIELDS;
+        }
         return DepsTracker::State::SEE_NEXT;
     };
 

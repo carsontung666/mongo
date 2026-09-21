@@ -52,6 +52,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <set>
@@ -783,6 +784,26 @@ public:
      */
     virtual boost::optional<ScopedSetShardRole> setLocalRouting(
         OperationContext* opCtx, const NamespaceString& subPipelineNss) = 0;
+
+    /**
+     * Whole-walk $graphLookup helper for an equality-prefix btree. Runs every BFS level
+     * under one collection acquisition and one index cursor. Children are read from the
+     * index (no FETCH). 'scalarField' must be in the key; each result is that field's
+     * Value. Returns false if this process cannot serve the walk. An empty 'startValues'
+     * probes index eligibility.
+     */
+    virtual bool graphLookupTreeBFS(OperationContext* opCtx,
+                                    const NamespaceString& from,
+                                    const BSONObj& additionalEqualities,
+                                    std::string_view connectToField,
+                                    std::string_view connectFromField,
+                                    const std::vector<Value>& startValues,
+                                    boost::optional<long long> maxDepth,
+                                    const std::string* scalarField,
+                                    const std::vector<std::string>* projectFields,
+                                    std::vector<Value>* results) {
+        return false;
+    }
 
 private:
     /**

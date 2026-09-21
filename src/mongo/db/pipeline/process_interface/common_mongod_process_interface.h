@@ -108,6 +108,17 @@ public:
     query_shape::CollectionType getCollectionType(OperationContext* opCtx,
                                                   const NamespaceString& nss) override;
 
+    bool graphLookupTreeBFS(OperationContext* opCtx,
+                            const NamespaceString& from,
+                            const BSONObj& additionalEqualities,
+                            std::string_view connectToField,
+                            std::string_view connectFromField,
+                            const std::vector<Value>& startValues,
+                            boost::optional<long long> maxDepth,
+                            const std::string* scalarField,
+                            const std::vector<std::string>* projectFields,
+                            std::vector<Value>* results) override;
+
     std::unique_ptr<Pipeline> attachCursorSourceToPipelineForLocalReadWithCatalog(
         std::unique_ptr<Pipeline> pipeline,
         const MultipleCollectionAccessor& collections,
