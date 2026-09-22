@@ -55,6 +55,10 @@ struct GraphLookUpParams {
     boost::optional<OwnedLiteParsedPipeline>
         fromLpp;  // Always set after construction: the resolved view definition(s) for 'from', or
                   // an empty pipeline for a regular collection.
+
+    // Set when a following {$project:{_id:0, out:"$as.field"}} is absorbed.
+    boost::optional<std::string> absorbedOutputField;
+    boost::optional<std::string> absorbedScalarField;
 };
 
 class DocumentSourceGraphLookUp final : public DocumentSource {
@@ -132,6 +136,9 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         expression::addDependencies(_params.startWith.get(), deps);
+        if (_params.absorbedOutputField) {
+            return DepsTracker::State::EXHAUSTIVE_FIELDS;
+        }
         return DepsTracker::State::SEE_NEXT;
     };
 

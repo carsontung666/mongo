@@ -12,6 +12,7 @@
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/pipeline/document_source_graph_lookup_gen.h"
 #include "mongo/db/pipeline/document_source_hybrid_scoring_util.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_builder.h"
@@ -20,6 +21,7 @@
 #include "mongo/db/pipeline/pipeline_factory.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/sort_reorder_helpers.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
@@ -29,6 +31,7 @@
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
+#include <algorithm>
 #include <memory>
 #include <string_view>
 
@@ -197,6 +200,45 @@ DocumentSourceContainer::iterator DocumentSourceGraphLookUp::optimizeAt(
         itr = tryReorderingWithSort(itr, container);
         if (*itr != this) {
             return itr;
+        }
+    }
+
+    if (!_unwind && !_params.depthField && std::next(itr) != container->end() &&
+        internalQueryEnableGraphLookupIndexScan.load()) {
+        auto next = std::next(itr);
+        auto* proj = dynamic_cast<DocumentSourceSingleDocumentTransformation*>(next->get());
+        if (proj &&
+            proj->getTransformerType() ==
+                TransformerInterface::TransformerType::kInclusionProjection) {
+            // Exact {$project:{_id:0, out:"$as.field"}} only. A sibling expression would be dropped.
+            const BSONObj spec = proj->getTransformer().serializeTransformation().toBson();
+            BSONElement idElt;
+            BSONElement outElt;
+            int nFields = 0;
+            for (auto&& e : spec) {
+                ++nFields;
+                if (e.fieldNameStringData() == "_id") {
+                    idElt = e;
+                } else {
+                    outElt = e;
+                }
+            }
+            const bool idExcluded = !idElt.eoo() &&
+                ((idElt.type() == BSONType::boolean && !idElt.boolean()) ||
+                 (idElt.isNumber() && idElt.numberInt() == 0));
+            if (nFields == 2 && idExcluded && !outElt.eoo() && outElt.type() == BSONType::string) {
+                const auto srcStr = outElt.valueStringData();
+                if (srcStr.size() > 1 && srcStr[0] == '$') {
+                    const FieldPath src{srcStr.substr(1)};
+                    if (src.getPathLength() == 2 &&
+                        src.getFieldName(0) == getAsField().fullPath()) {
+                        _params.absorbedOutputField = std::string{outElt.fieldNameStringData()};
+                        _params.absorbedScalarField = std::string{src.getFieldName(1)};
+                        container->erase(next);
+                        return itr;
+                    }
+                }
+            }
         }
     }
 

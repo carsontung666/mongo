@@ -223,6 +223,9 @@ private:
     // field, tracking how many results we've returned so far for the current input document.
     long long _outputIndex = 0;
 
+    // Covered / fused BFS result. When set, doGetNext() emits this instead of _visitedDocuments.
+    boost::optional<std::vector<Value>> _fastPathValues;
+
     // An internal struct for sharing container state between multiple queries that can be executed
     // by the graph lookup stage. The containers used in here are referenced by the 'Query'
     // instances created by the graph lookup stage.

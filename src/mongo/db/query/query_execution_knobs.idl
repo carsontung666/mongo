@@ -701,6 +701,20 @@ server_parameters:
                 fcv:
                     min: "9.0"
 
+    internalQueryEnableGraphLookupIndexScan:
+        description: >-
+            When true, $graphLookup may replace the stock BFS with a covering
+            tree walk: one index cursor, seek per parent on a non-multikey
+            equality-prefix btree that contains connectFrom. Requires a
+            following {$project:{_id:0, out:"$as.field"}}. Falls back to the
+            pipeline BFS when no such index exists, startWith is missing, the
+            extra filter is not equalities, or the foreign namespace is a view.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryEnableGraphLookupIndexScan"
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
     internalQueryEnablePlanShapeAnalysis:
         mod_visibility: needs_replacement
         description: "Knob to control whether we collect plan shape counters for query stats."

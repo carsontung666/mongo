@@ -52,6 +52,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <set>
@@ -783,6 +784,20 @@ public:
      */
     virtual boost::optional<ScopedSetShardRole> setLocalRouting(
         OperationContext* opCtx, const NamespaceString& subPipelineNss) = 0;
+
+    // Covered BFS over an equality-prefix btree. Each result is 'scalarField' from the index
+    // key. Returns false when this process cannot serve the walk.
+    virtual bool graphLookupTreeBFS(OperationContext* opCtx,
+                                    const NamespaceString& from,
+                                    const BSONObj& additionalEqualities,
+                                    std::string_view connectToField,
+                                    std::string_view connectFromField,
+                                    const std::vector<Value>& startValues,
+                                    boost::optional<long long> maxDepth,
+                                    const std::string* scalarField,
+                                    std::vector<Value>* results) {
+        return false;
+    }
 
 private:
     /**
