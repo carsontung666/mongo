@@ -3,12 +3,10 @@
 
 #include "mongo/db/exec/agg/graph_lookup_stage.h"
 
-#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/agg/document_source_to_stage_registry.h"
 #include "mongo/db/exec/agg/pipeline_builder.h"
 #include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
-#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/expression_context_builder.h"
 #include "mongo/db/pipeline/lite_parsed_desugarer.h"
@@ -16,8 +14,8 @@
 #include "mongo/db/pipeline/optimization/optimize.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_factory.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/resolved_namespace.h"  // IWYU pragma: keep
-#include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
 #include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
 #include "mongo/db/stats/counters.h"
@@ -25,7 +23,6 @@
 #include "mongo/util/fail_point.h"
 
 #include <string_view>
-#include <vector>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -150,14 +147,10 @@ GetNextResult GraphLookUpStage::doGetNext() {
 
     performSearch();
 
-    if (_fastPathValues) {
-        Value asVal(std::move(*_fastPathValues));
-        _fastPathValues.reset();
-        if (_params.absorbedOutputField) {
-            return Document{{*_params.absorbedOutputField, std::move(asVal)}};
-        }
+    if (_coveredAs) {
         MutableDocument output(*_input);
-        output.setNestedField(_params.as, std::move(asVal));
+        output.setNestedField(_params.as, std::move(*_coveredAs));
+        _coveredAs.reset();
         return output.freeze();
     }
 
@@ -179,17 +172,9 @@ GetNextResult GraphLookUpStage::doGetNext() {
          _visitedDocuments.eraseIfInMemoryAndAdvance(it)) {
         totalSize += it->getApproximateSize();
         uassertTotalSize();
-        if (_params.absorbedScalarField) {
-            results.push_back(it->getField(std::string_view{*_params.absorbedScalarField}));
-        } else {
-            results.emplace_back(std::move(*it));
-        }
+        results.emplace_back(std::move(*it));
     }
     _visitedDocuments.clear();
-
-    if (_params.absorbedOutputField) {
-        return Document{{*_params.absorbedOutputField, Value(std::move(results))}};
-    }
 
     MutableDocument output(*_input);
     output.setNestedField(_params.as, Value(std::move(results)));
@@ -284,88 +269,54 @@ GetNextResult GraphLookUpStage::getNextUnwound() {
     }
 }
 
-namespace {
-boost::optional<BSONObj> parseGraphLookupEqualities(const boost::optional<BSONObj>& filter) {
-    if (!filter || filter->isEmpty()) {
-        return BSONObj();
+boost::optional<Value> GraphLookUpStage::coveredWalk(const Value& startingValue) {
+    auto opCtx = pExpCtx->getOperationContext();
+    auto values = _fromExpCtx->getMongoProcessInterface()->graphLookupTreeBFS(
+        opCtx,
+        _fromExpCtx->getNamespaceString(),
+        _params.coveredWalk->equalities,
+        _params.connectToField.fullPath(),
+        _params.connectFromField.fullPath(),
+        _params.coveredWalk->field,
+        startingValue.isArray() ? startingValue.getArray() : std::vector<Value>{startingValue},
+        _params.maxDepth,
+        std::min(
+            _memoryUsageTracker.maxAllowedMemoryUsageBytes(opCtx),
+            static_cast<int64_t>(internalGraphLookupStageIntermediateDocumentMaxSizeBytes.load())),
+        &_stats.planSummaryStats);
+    if (!values) {
+        return boost::none;
     }
-    BSONObjBuilder eqs;
-    for (auto&& e : *filter) {
-        if (!e.fieldNameStringData().empty() && e.fieldNameStringData()[0] == '$') {
-            return boost::none;
-        }
-        if (e.type() == BSONType::object) {
-            auto obj = e.Obj();
-            if (obj.nFields() == 1 &&
-                std::string_view{obj.firstElementFieldName()} == "$eq") {
-                const auto eqv = obj.firstElement();
-                if (eqv.type() == BSONType::regEx || eqv.type() == BSONType::array ||
-                    eqv.type() == BSONType::code || eqv.type() == BSONType::codeWScope) {
-                    return boost::none;
-                }
-                eqs.appendAs(eqv, e.fieldNameStringData());
-                continue;
-            }
-            return boost::none;
-        }
-        if (e.type() == BSONType::array || e.type() == BSONType::regEx ||
-            e.type() == BSONType::code || e.type() == BSONType::codeWScope) {
-            return boost::none;
-        }
-        eqs.append(e);
+    std::vector<Value> as;
+    as.reserve(values->size());
+    for (auto& v : *values) {
+        as.emplace_back(Document{{_params.coveredWalk->field, std::move(v)}});
     }
-    return eqs.obj();
+    return Value(std::move(as));
 }
-}  // namespace
 
 void GraphLookUpStage::performSearch() {
     // Make sure _input is set before calling performSearch().
     invariant(_input);
-    _fastPathValues.reset();
 
     Value startingValue =
         _params.startWith->evaluate(*_input, &pExpCtx->variables, _expressionEvalCtx);
 
-    std::vector<Value> starts;
-    if (startingValue.isArray()) {
-        for (const auto& value : startingValue.getArray()) {
-            starts.push_back(value);
-        }
-    } else {
-        starts.push_back(std::move(startingValue));
-    }
-
-    const bool tryCoveredBFS = internalQueryEnableGraphLookupIndexScan.load() &&
-        !_fromExpCtx->getInRouter() && !_unwind && !_params.depthField &&
-        _params.connectToField.getPathLength() == 1 &&
-        _params.connectFromField.getPathLength() == 1 &&
-        _params.absorbedScalarField &&
-        (!_params.fromLpp || _params.fromLpp->pipeline().getStages().empty());
-    if (tryCoveredBFS) {
-        if (auto eqs = parseGraphLookupEqualities(_params.additionalFilter)) {
-            std::vector<Value> docs;
-            docs.reserve(64);
-            auto mpi = _fromExpCtx->getMongoProcessInterface();
-            if (mpi->graphLookupTreeBFS(pExpCtx->getOperationContext(),
-                                        _fromExpCtx->getNamespaceString(),
-                                        *eqs,
-                                        _params.connectToField.fullPath(),
-                                        _params.connectFromField.fullPath(),
-                                        starts,
-                                        _params.maxDepth,
-                                        &*_params.absorbedScalarField,
-                                        &docs)) {
-                LOGV2_DEBUG(10888001, 2, "$graphLookup using covered tree BFS");
-                _fastPathValues = std::move(docs);
-                return;
-            }
+    if (_params.coveredWalk) {
+        _coveredAs = coveredWalk(startingValue);
+        if (_coveredAs) {
+            return;
         }
     }
 
     // If _startWith evaluates to an array, treat each value as a separate starting point.
     _queue.clear();
-    for (auto& value : starts) {
-        addFromValueToQueueIfNeeded(std::move(value), 0 /*depth*/);
+    if (startingValue.isArray()) {
+        for (const auto& value : startingValue.getArray()) {
+            addFromValueToQueueIfNeeded(value, 0 /*depth*/);
+        }
+    } else {
+        addFromValueToQueueIfNeeded(std::move(startingValue), 0 /*depth*/);
     }
 
     try {

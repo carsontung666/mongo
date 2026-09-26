@@ -56,9 +56,13 @@ struct GraphLookUpParams {
         fromLpp;  // Always set after construction: the resolved view definition(s) for 'from', or
                   // an empty pipeline for a regular collection.
 
-    // Set when a following {$project:{_id:0, out:"$as.field"}} is absorbed.
-    boost::optional<std::string> absorbedOutputField;
-    boost::optional<std::string> absorbedScalarField;
+    // Set by optimizeAt() when the covered tree walk may run: 'as' elements then only need
+    // 'field', and 'equalities' is restrictSearchWithMatch as {field: value}.
+    struct CoveredWalk {
+        std::string field;
+        BSONObj equalities;
+    };
+    boost::optional<CoveredWalk> coveredWalk;
 };
 
 class DocumentSourceGraphLookUp final : public DocumentSource {
@@ -136,9 +140,6 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         expression::addDependencies(_params.startWith.get(), deps);
-        if (_params.absorbedOutputField) {
-            return DepsTracker::State::EXHAUSTIVE_FIELDS;
-        }
         return DepsTracker::State::SEE_NEXT;
     };
 
@@ -225,6 +226,9 @@ private:
      * Returns true if we are not in a transaction.
      */
     bool foreignShardedGraphLookupAllowed() const;
+
+    boost::optional<GraphLookUpParams::CoveredWalk> findCoveredWalk(
+        DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) const;
 
     GraphLookUpParams _params;
 

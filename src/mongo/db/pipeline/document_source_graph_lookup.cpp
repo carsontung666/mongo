@@ -9,10 +9,10 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/pipeline/document_source_graph_lookup_gen.h"
 #include "mongo/db/pipeline/document_source_hybrid_scoring_util.h"
-#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_builder.h"
@@ -31,7 +31,6 @@
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
-#include <algorithm>
 #include <memory>
 #include <string_view>
 
@@ -177,9 +176,87 @@ StageConstraints DocumentSourceGraphLookUp::constraints(PipelineSplitState pipeS
     return constraints;
 }
 
+namespace {
+// restrictSearchWithMatch as {field: value}, if it is only {field: v} or {field: {$eq: v}} terms
+// whose values compare by index key.
+boost::optional<BSONObj> equalityFilter(const boost::optional<BSONObj>& filter) {
+    BSONObjBuilder equalities;
+    for (auto&& e : filter.value_or(BSONObj())) {
+        if (e.fieldNameStringData().starts_with('$')) {
+            return boost::none;
+        }
+        auto value = e;
+        if (e.type() == BSONType::object) {
+            auto obj = e.Obj();
+            if (obj.nFields() != 1 || obj.firstElementFieldNameStringData() != "$eq") {
+                return boost::none;
+            }
+            value = obj.firstElement();
+        }
+        switch (value.type()) {
+            case BSONType::array:
+            case BSONType::regEx:
+            case BSONType::code:
+            case BSONType::codeWScope:
+                return boost::none;
+            default:
+                equalities.appendAs(value, e.fieldNameStringData());
+        }
+    }
+    return equalities.obj();
+}
+}  // namespace
+
+boost::optional<GraphLookUpParams::CoveredWalk> DocumentSourceGraphLookUp::findCoveredWalk(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) const {
+    if (!internalQueryEnableGraphLookupIndexScan.load() || _fromExpCtx->getInRouter() || _unwind ||
+        _params.depthField || _fromExpCtx->getCollator() ||
+        _params.connectToField.getPathLength() != 1 ||
+        _params.connectFromField.getPathLength() != 1 ||
+        !_params.fromLpp->pipeline().getStages().empty()) {
+        return boost::none;
+    }
+    auto equalities = equalityFilter(_params.additionalFilter);
+    if (!equalities) {
+        return boost::none;
+    }
+
+    // The rest of the pipeline may read only one '<as>.<field>' path of 'as'.
+    const auto deps = Pipeline::getDependenciesForContainer(
+        getExpCtx(),
+        DocumentSourceContainer{std::next(itr), container->end()},
+        DepsTracker::NoMetadataValidation());
+    if (deps.needWholeDocument) {
+        return boost::none;
+    }
+    const auto& as = _params.as.fullPath();
+    boost::optional<std::string> field;
+    for (const auto& path : deps.fields) {
+        if (path == as || expression::isPathPrefixOf(path, as)) {
+            return boost::none;
+        }
+        if (!expression::isPathPrefixOf(as, path)) {
+            continue;
+        }
+        auto sub = path.substr(as.size() + 1);
+        // A numeric component may be an array position.
+        if (sub.find_first_not_of("0123456789") == std::string::npos ||
+            sub.find('.') != std::string::npos || (field && *field != sub)) {
+            return boost::none;
+        }
+        field = std::move(sub);
+    }
+    if (!field) {
+        return boost::none;
+    }
+    return GraphLookUpParams::CoveredWalk{std::move(*field), std::move(*equalities)};
+}
+
 DocumentSourceContainer::iterator DocumentSourceGraphLookUp::optimizeAt(
     DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
     tassert(11294801, "Expecting DocumentSource iterator pointing to this stage", *itr == this);
+
+    _params.coveredWalk = findCoveredWalk(itr, container);
 
     if (std::next(itr) == container->end()) {
         return container->end();
@@ -200,45 +277,6 @@ DocumentSourceContainer::iterator DocumentSourceGraphLookUp::optimizeAt(
         itr = tryReorderingWithSort(itr, container);
         if (*itr != this) {
             return itr;
-        }
-    }
-
-    if (!_unwind && !_params.depthField && std::next(itr) != container->end() &&
-        internalQueryEnableGraphLookupIndexScan.load()) {
-        auto next = std::next(itr);
-        auto* proj = dynamic_cast<DocumentSourceSingleDocumentTransformation*>(next->get());
-        if (proj &&
-            proj->getTransformerType() ==
-                TransformerInterface::TransformerType::kInclusionProjection) {
-            // Exact {$project:{_id:0, out:"$as.field"}} only. A sibling expression would be dropped.
-            const BSONObj spec = proj->getTransformer().serializeTransformation().toBson();
-            BSONElement idElt;
-            BSONElement outElt;
-            int nFields = 0;
-            for (auto&& e : spec) {
-                ++nFields;
-                if (e.fieldNameStringData() == "_id") {
-                    idElt = e;
-                } else {
-                    outElt = e;
-                }
-            }
-            const bool idExcluded = !idElt.eoo() &&
-                ((idElt.type() == BSONType::boolean && !idElt.boolean()) ||
-                 (idElt.isNumber() && idElt.numberInt() == 0));
-            if (nFields == 2 && idExcluded && !outElt.eoo() && outElt.type() == BSONType::string) {
-                const auto srcStr = outElt.valueStringData();
-                if (srcStr.size() > 1 && srcStr[0] == '$') {
-                    const FieldPath src{srcStr.substr(1)};
-                    if (src.getPathLength() == 2 &&
-                        src.getFieldName(0) == getAsField().fullPath()) {
-                        _params.absorbedOutputField = std::string{outElt.fieldNameStringData()};
-                        _params.absorbedScalarField = std::string{src.getFieldName(1)};
-                        container->erase(next);
-                        return itr;
-                    }
-                }
-            }
         }
     }
 

@@ -91,6 +91,12 @@ private:
      */
     void performSearch();
 
+    /**
+     * Runs the search as a covered index walk. Returns the 'as' array, or boost::none if the walk
+     * cannot reproduce the stock search.
+     */
+    boost::optional<Value> coveredWalk(const Value& startingValue);
+
     void updateSpillingStats();
 
     void spillDuringVisitedUnwinding();
@@ -223,8 +229,8 @@ private:
     // field, tracking how many results we've returned so far for the current input document.
     long long _outputIndex = 0;
 
-    // Covered / fused BFS result. When set, doGetNext() emits this instead of _visitedDocuments.
-    boost::optional<std::vector<Value>> _fastPathValues;
+    // The 'as' array from the covered walk for the current input, if it ran.
+    boost::optional<Value> _coveredAs;
 
     // An internal struct for sharing container state between multiple queries that can be executed
     // by the graph lookup stage. The containers used in here are referenced by the 'Query'

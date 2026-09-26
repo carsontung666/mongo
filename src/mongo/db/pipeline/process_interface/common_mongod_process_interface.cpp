@@ -8,16 +8,12 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/exec/document_value/document.h"
 #include "mongo/bson/dotted_path/dotted_path_support.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name_util.h"
-#include "mongo/db/index_names.h"
-#include "mongo/db/keypattern.h"
-#include "mongo/stdx/unordered_set.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/agg/pipeline_builder.h"
@@ -25,6 +21,9 @@
 #include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/exec/matcher/matcher.h"
 #include "mongo/db/flow_control_ticketholder.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/catalog_resource_handle.h"
@@ -42,12 +41,8 @@
 #include "mongo/db/query/client_cursor/cursor_manager.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
-#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/multiple_collection_accessor.h"
-#include "mongo/db/storage/index_entry_comparison.h"
-#include "mongo/db/storage/key_string/key_string.h"
-#include "mongo/db/storage/snapshot.h"
 #include "mongo/db/query/plan_cache/plan_cache.h"
 #include "mongo/db/query/plan_cache/sbe_plan_cache.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
@@ -90,6 +85,8 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/mdb_catalog.h"
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -109,9 +106,11 @@
 #include "mongo/s/analyze_shard_key_role.h"
 #include "mongo/s/query_analysis_sample_tracker.h"
 #include "mongo/s/query_analysis_sampler_util.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 #include <algorithm>
@@ -1493,182 +1492,204 @@ Value valueFromDehydratedKey(const BSONObj& keyPattern,
     return Value();
 }
 
+// Whether {$in: [v]} is plain key equality: stock adds {$exists: true} for null, matches a regex
+// by pattern and may parse an object as an operator.
+bool seekMatchesStockIn(const Value& v) {
+    switch (v.getType()) {
+        case BSONType::eoo:
+        case BSONType::null:
+        case BSONType::undefined:
+        case BSONType::regEx:
+        case BSONType::array:
+        case BSONType::object:
+            return false;
+        default:
+            return true;
+    }
+}
+
 const IndexCatalogEntry* findEqualityPrefixIndex(OperationContext* opCtx,
                                                  const CollectionPtr& coll,
-                                                 const BSONObj& additionalEqualities,
+                                                 const BSONObj& equalities,
                                                  std::string_view connectToField,
-                                                 std::string_view connectFromField) {
+                                                 std::string_view connectFromField,
+                                                 std::string_view outputField) {
     stdx::unordered_set<std::string> needed;
-    for (auto&& e : additionalEqualities) {
+    for (auto&& e : equalities) {
         needed.emplace(e.fieldName());
     }
-    if (!needed.insert(std::string{connectToField}).second) {
-        // connectToField is already an additional equality; refuse rather than double-bind.
+    // Each index field binds one value.
+    if (needed.size() != static_cast<size_t>(equalities.nFields()) ||
+        !needed.insert(std::string{connectToField}).second) {
         return nullptr;
     }
     const auto nNeeded = needed.size();
 
-    auto catalog = coll->getIndexCatalog();
-    if (!catalog) {
-        return nullptr;
-    }
-    auto it = catalog->getIndexIterator(IndexCatalog::InclusionPolicy::kReady);
+    auto it = coll->getIndexCatalog()->getIndexIterator(IndexCatalog::InclusionPolicy::kReady);
     while (it->more()) {
         const auto* entry = it->next();
         const auto* desc = entry->descriptor();
+        // Collated keys are not the field values.
         if (desc->getIndexType() != INDEX_BTREE || desc->isSetSparseByUser() || desc->isPartial() ||
-            desc->hidden() || entry->isMultikey(opCtx, coll)) {
+            desc->hidden() || entry->getCollator() || entry->isMultikey(opCtx, coll)) {
             continue;
         }
         const BSONObj kp = desc->keyPattern();
         if (static_cast<size_t>(kp.nFields()) < nNeeded) {
             continue;
         }
-        auto remaining = needed;
-        size_t matched = 0;
+        BSONObjIterator kpIt(kp);
         bool ok = true;
-        for (auto&& e : kp) {
-            if (matched == nNeeded) {
-                break;
-            }
-            if (e.numberInt() != 1) {
-                ok = false;
-                break;
-            }
-            auto taken = remaining.erase(std::string{e.fieldNameStringData()});
-            if (!taken) {
-                ok = false;
-                break;
-            }
-            ++matched;
+        for (size_t i = 0; ok && i < nNeeded; ++i) {
+            auto e = kpIt.next();
+            ok = e.numberInt() == 1 && needed.contains(std::string{e.fieldNameStringData()});
         }
-        if (ok && remaining.empty() && keyPatternHasField(kp, connectFromField)) {
+        if (ok && keyPatternHasField(kp, connectFromField) && keyPatternHasField(kp, outputField)) {
             return entry;
         }
     }
     return nullptr;
 }
 
-BSONObj equalityPrefixBound(const BSONObj& keyPattern,
-                            const BSONObj& additionalEqualities,
-                            std::string_view connectToField,
-                            const Value& connectToValue,
-                            bool upper) {
+// The index key prefix fixed by 'equalities' and connectTo = 'connectToValue'.
+BSONObj equalityPrefix(const BSONObj& keyPattern,
+                       const BSONObj& equalities,
+                       std::string_view connectToField,
+                       const Value& connectToValue) {
     BSONObjBuilder prefix;
-    size_t used = 0;
-    const size_t nEq = static_cast<size_t>(additionalEqualities.nFields()) + 1;
-    for (auto&& e : keyPattern) {
-        if (used == nEq) {
-            break;
-        }
-        const auto name = e.fieldNameStringData();
+    BSONObjIterator kpIt(keyPattern);
+    for (int i = 0; i <= equalities.nFields(); ++i) {
+        const auto name = kpIt.next().fieldNameStringData();
         if (name == connectToField) {
             connectToValue.addToBsonObj(&prefix, name);
-        } else if (auto eq = additionalEqualities[name]) {
-            prefix.appendAs(eq, name);
         } else {
-            tasserted(10888000, "Index prefix field missing from graphLookup equalities");
+            prefix.appendAs(equalities[name], name);
         }
-        ++used;
     }
-    KeyPattern kp(keyPattern);
-    return Helpers::toKeyFormat(kp.extendRangeBound(prefix.obj(), upper));
+    return prefix.obj();
 }
 
 }  // namespace
 
-bool CommonMongodProcessInterface::graphLookupTreeBFS(
+boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupTreeBFS(
     OperationContext* opCtx,
     const NamespaceString& from,
-    const BSONObj& additionalEqualities,
+    const BSONObj& equalities,
     std::string_view connectToField,
     std::string_view connectFromField,
+    std::string_view outputField,
     const std::vector<Value>& startValues,
     boost::optional<long long> maxDepth,
-    const std::string* scalarField,
-    std::vector<Value>* results) {
-    const auto acquisition = acquireCollectionMaybeLockFree(
-        opCtx,
-        CollectionAcquisitionRequest(from,
-                                     PlacementConcern::kPretendUnsharded,
-                                     repl::ReadConcernArgs::get(opCtx),
-                                     AcquisitionPrerequisites::kRead));
-    if (!acquisition.exists()) {
-        return false;
-    }
-    const auto& coll = acquisition.getCollectionPtr();
-    const auto* indexEntry = findEqualityPrefixIndex(
-        opCtx, coll, additionalEqualities, connectToField, connectFromField);
-    if (!indexEntry) {
-        return false;
-    }
-    if (!scalarField || !keyPatternHasField(indexEntry->descriptor()->keyPattern(), *scalarField)) {
-        return false;
-    }
-
-    auto* iam = indexEntry->accessMethod()->asSortedData();
-    if (!iam) {
-        return false;
-    }
-    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
-    auto cursor = iam->newCursor(opCtx, ru, true /* forward */);
-    const auto* sdi = iam->getSortedDataInterface();
-    key_string::Builder builder(sdi->getKeyStringVersion());
-    const BSONObj keyPattern = indexEntry->descriptor()->keyPattern();
-    const bool scalarIsFrom = *scalarField == connectFromField;
-
-    // Do not re-expand a connectFrom already used as a parent. Each index entry is still emitted.
-    const ValueComparator valueCmp;
-    auto visited = valueCmp.makeFlatUnorderedValueSet();
-    std::vector<Value> frontier;
-    frontier.reserve(startValues.size());
+    int64_t maxMemoryBytes,
+    PlanSummaryStats* stats) {
     for (const auto& s : startValues) {
-        if (s.missing()) {
-            return false;
+        if (!seekMatchesStockIn(s)) {
+            return boost::none;
         }
-        visited.insert(s);
-        frontier.push_back(s);
     }
 
-    long long depth = 0;
-    while (!frontier.empty()) {
-        const bool needFrontier = !maxDepth || depth < *maxDepth;
-        std::vector<Value> next;
-        if (needFrontier) {
-            next.reserve(frontier.size() * 8);
-        }
-        for (const auto& parent : frontier) {
-            auto startKey = equalityPrefixBound(
-                keyPattern, additionalEqualities, connectToField, parent, false);
-            auto endKey = equalityPrefixBound(
-                keyPattern, additionalEqualities, connectToField, parent, true);
-            cursor->setEndPosition(endKey, true /* inclusive */);
-            auto seekKey = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
-                startKey, sdi->getOrdering(), true /* forward */, true /* inclusive */, builder);
-            for (auto entry =
-                     cursor->seek(ru, seekKey, SortedDataInterface::Cursor::KeyInclusion::kInclude);
-                 entry;
-                 entry = cursor->next(ru, SortedDataInterface::Cursor::KeyInclusion::kInclude)) {
-                Value fromVal = valueFromDehydratedKey(keyPattern, entry->key, connectFromField);
-                if (fromVal.getType() == BSONType::array) {
-                    results->clear();
-                    return false;
-                }
-                if (scalarIsFrom) {
-                    results->push_back(fromVal);
-                } else {
-                    results->push_back(
-                        valueFromDehydratedKey(keyPattern, entry->key, *scalarField));
-                }
-                if (needFrontier && !fromVal.missing() && visited.insert(fromVal).second) {
-                    next.push_back(std::move(fromVal));
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+    return writeConflictRetry(
+        opCtx, ru, "graphLookupTreeBFS", from, [&]() -> boost::optional<std::vector<Value>> {
+            // kPretendUnsharded: ShardServerProcessInterface never runs this walk.
+            const auto acquisition = acquireCollectionMaybeLockFree(
+                opCtx,
+                CollectionAcquisitionRequest(from,
+                                             PlacementConcern::kPretendUnsharded,
+                                             repl::ReadConcernArgs::get(opCtx),
+                                             AcquisitionPrerequisites::kRead));
+            if (!acquisition.exists()) {
+                return boost::none;
+            }
+            const auto& coll = acquisition.getCollectionPtr();
+            // Stock unpacks timeseries buckets, and needs a unique _id to dedupe documents.
+            if (coll->isTimeseriesCollection() ||
+                !(coll->isClustered() || coll->getIndexCatalog()->findIdIndex(opCtx))) {
+                return boost::none;
+            }
+            const auto* indexEntry = findEqualityPrefixIndex(
+                opCtx, coll, equalities, connectToField, connectFromField, outputField);
+            if (!indexEntry) {
+                return boost::none;
+            }
+            const BSONObj keyPattern = indexEntry->descriptor()->keyPattern();
+            auto* iam = indexEntry->accessMethod()->asSortedData();
+
+            auto cursor = iam->newCursor(opCtx, ru, true /* forward */);
+            const auto* sdi = iam->getSortedDataInterface();
+            key_string::Builder builder(sdi->getKeyStringVersion());
+            const KeyPattern kp(keyPattern);
+            const bool outputIsFrom = outputField == connectFromField;
+
+            size_t keysExamined = 0;
+            ON_BLOCK_EXIT([&] { stats->totalKeysExamined += keysExamined; });
+
+            // Query each connectFrom value once, as stock does. Non-multikey: no repeats.
+            const ValueComparator valueCmp;
+            auto visited = valueCmp.makeFlatUnorderedValueSet();
+            std::vector<Value> frontier;
+            int64_t memoryBytes = 0;
+            for (const auto& s : startValues) {
+                if (visited.insert(s).second) {
+                    memoryBytes += s.getApproximateSize();
+                    frontier.push_back(s);
                 }
             }
-        }
-        frontier = std::move(next);
-        ++depth;
-    }
-    return true;
+
+            std::vector<Value> results;
+            for (long long depth = 0; !frontier.empty(); ++depth) {
+                const bool expand = !maxDepth || depth < *maxDepth;
+                std::vector<Value> next;
+                for (const auto& parent : frontier) {
+                    opCtx->checkForInterrupt();
+                    const auto prefix =
+                        equalityPrefix(keyPattern, equalities, connectToField, parent);
+                    cursor->setEndPosition(Helpers::toKeyFormat(kp.extendRangeBound(prefix, true)),
+                                           true /* inclusive */);
+                    auto seekKey = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                        Helpers::toKeyFormat(kp.extendRangeBound(prefix, false)),
+                        sdi->getOrdering(),
+                        true /* forward */,
+                        true /* inclusive */,
+                        builder);
+                    for (auto entry = cursor->seek(
+                             ru, seekKey, SortedDataInterface::Cursor::KeyInclusion::kInclude);
+                         entry;
+                         entry = cursor->next(
+                             ru, SortedDataInterface::Cursor::KeyInclusion::kInclude)) {
+                        ++keysExamined;
+                        Value fromVal =
+                            valueFromDehydratedKey(keyPattern, entry->key, connectFromField);
+                        Value out = outputIsFrom
+                            ? fromVal
+                            : valueFromDehydratedKey(keyPattern, entry->key, outputField);
+                        // A null key may be a missing field, which stock treats differently.
+                        if (out.nullish() || (expand && !seekMatchesStockIn(fromVal))) {
+                            return boost::none;
+                        }
+                        memoryBytes += sizeof(Value) + out.getApproximateSize();
+                        if (expand && visited.insert(fromVal).second) {
+                            memoryBytes += fromVal.getApproximateSize();
+                            next.push_back(std::move(fromVal));
+                        }
+                        if (memoryBytes > maxMemoryBytes) {
+                            return boost::none;
+                        }
+                        results.push_back(std::move(out));
+                    }
+                }
+                frontier = std::move(next);
+            }
+
+            const auto& indexName = indexEntry->descriptor()->indexName();
+            stats->indexesUsed.insert(indexName);
+            CollectionIndexUsageTrackerDecoration::recordCollectionIndexUsage(
+                coll.get(),
+                0 /* collectionScans */,
+                0 /* collectionScansNonTailable */,
+                {indexName});
+            return results;
+        });
 }
 
 }  // namespace mongo

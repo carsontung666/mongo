@@ -31,6 +31,7 @@
 
 #include <list>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include <boost/none.hpp>
@@ -115,6 +116,20 @@ public:
 
     query_shape::CollectionType getCollectionType(OperationContext* opCtx,
                                                   const NamespaceString& nss) final;
+
+    // The covered walk has no shard version check or orphan filter.
+    boost::optional<std::vector<Value>> graphLookupTreeBFS(OperationContext* opCtx,
+                                                           const NamespaceString& from,
+                                                           const BSONObj& equalities,
+                                                           std::string_view connectToField,
+                                                           std::string_view connectFromField,
+                                                           std::string_view outputField,
+                                                           const std::vector<Value>& startValues,
+                                                           boost::optional<long long> maxDepth,
+                                                           int64_t maxMemoryBytes,
+                                                           PlanSummaryStats* stats) final {
+        return boost::none;
+    }
 
     std::vector<BSONObj> getIndexSpecs(OperationContext* opCtx,
                                        const NamespaceString& ns,
