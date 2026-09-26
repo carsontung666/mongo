@@ -26,6 +26,7 @@
 #include "mongo/db/query/client_cursor/generic_cursor.h"
 #include "mongo/db/query/client_cursor/generic_cursor_gen.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/write_ops/write_ops_exec.h"
 #include "mongo/db/query/write_ops/write_ops_gen.h"
 #include "mongo/db/query/write_ops/write_ops_parsers.h"
@@ -783,6 +784,25 @@ public:
      */
     virtual boost::optional<ScopedSetShardRole> setLocalRouting(
         OperationContext* opCtx, const NamespaceString& subPipelineNss) = 0;
+
+    /**
+     * Runs a $graphLookup search as a covered walk of a non-multikey btree whose prefix is the
+     * 'equalities' fields plus 'connectToField'. Returns 'outputField' of every document reached,
+     * or boost::none if the walk cannot answer exactly and the subpipeline search must run.
+     */
+    virtual boost::optional<std::vector<Value>> graphLookupCoveredWalk(
+        OperationContext* opCtx,
+        const NamespaceString& from,
+        const BSONObj& equalities,
+        std::string_view connectToField,
+        std::string_view connectFromField,
+        std::string_view outputField,
+        const std::vector<Value>& startValues,
+        boost::optional<long long> maxDepth,
+        int64_t maxMemoryBytes,
+        PlanSummaryStats* stats) {
+        return boost::none;
+    }
 
 private:
     /**

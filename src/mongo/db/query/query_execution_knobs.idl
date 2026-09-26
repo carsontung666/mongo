@@ -701,6 +701,20 @@ server_parameters:
                 fcv:
                     min: "9.0"
 
+    internalQueryEnableGraphLookupCoveredWalk:
+        description: >-
+            When true, $graphLookup may run as a covered walk over a non-multikey
+            btree led by the restrictSearchWithMatch equality fields and
+            connectToField, if the rest of the pipeline reads only one
+            '<as>.<field>' path. Not used for operations routed to a shard or
+            with a non-simple collation. Any input the walk cannot answer
+            exactly runs the usual subpipeline search.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryEnableGraphLookupCoveredWalk"
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
     internalQueryEnablePlanShapeAnalysis:
         mod_visibility: needs_replacement
         description: "Knob to control whether we collect plan shape counters for query stats."

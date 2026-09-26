@@ -14,6 +14,7 @@
 #include "mongo/db/pipeline/optimization/optimize.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_factory.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/resolved_namespace.h"  // IWYU pragma: keep
 #include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
 #include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
@@ -116,6 +117,9 @@ Document GraphLookUpStage::getExplainOutput(const query_shape::SerializationOpti
         opts.serializeLiteral(static_cast<long long>(_stats.spillingStats.getSpilledBytes()));
     out["spilledRecords"] =
         opts.serializeLiteral(static_cast<long long>(_stats.spillingStats.getSpilledRecords()));
+    if (_stats.coveredWalks > 0) {
+        out["coveredWalks"] = opts.serializeLiteral(static_cast<long long>(_stats.coveredWalks));
+    }
     if (feature_flags::gFeatureFlagQueryMemoryTracking.isEnabled()) {
         out["peakTrackedMemBytes"] =
             opts.serializeLiteral(static_cast<long long>(_stats.maxMemoryUsageBytes));
@@ -145,6 +149,13 @@ GetNextResult GraphLookUpStage::doGetNext() {
     _input = input.releaseDocument();
 
     performSearch();
+
+    if (_coveredAs) {
+        MutableDocument output(*_input);
+        output.setNestedField(_params.as, std::move(_coveredAs->value()));
+        _coveredAs.reset();
+        return output.freeze();
+    }
 
     const size_t maxOutputSize =
         static_cast<size_t>(internalGraphLookupStageIntermediateDocumentMaxSizeBytes.load());
@@ -261,12 +272,48 @@ GetNextResult GraphLookUpStage::getNextUnwound() {
     }
 }
 
+bool GraphLookUpStage::coveredWalk(const Value& startingValue) {
+    auto opCtx = pExpCtx->getOperationContext();
+    const std::vector<Value> one{startingValue};
+    auto values = _fromExpCtx->getMongoProcessInterface()->graphLookupCoveredWalk(
+        opCtx,
+        _fromExpCtx->getNamespaceString(),
+        _params.coveredWalk->equalities,
+        _params.connectToField.fullPath(),
+        _params.connectFromField.fullPath(),
+        _params.coveredWalk->field,
+        startingValue.isArray() ? startingValue.getArray() : one,
+        _params.maxDepth,
+        std::min(
+            _memoryUsageTracker.maxAllowedMemoryUsageBytes(opCtx),
+            static_cast<int64_t>(internalGraphLookupStageIntermediateDocumentMaxSizeBytes.load())),
+        &_stats.planSummaryStats);
+    if (!values) {
+        return false;
+    }
+    std::vector<Value> as;
+    as.reserve(values->size());
+    int64_t bytes = 0;
+    for (auto& v : *values) {
+        as.emplace_back(Document{{_params.coveredWalk->field, std::move(v)}});
+        bytes += as.back().getApproximateSize();
+    }
+    _coveredAs.emplace(MemoryUsageTokenImpl<MemoryUsageTracker>(bytes, &_memoryUsageTracker),
+                       std::move(as));
+    ++_stats.coveredWalks;
+    return true;
+}
+
 void GraphLookUpStage::performSearch() {
     // Make sure _input is set before calling performSearch().
     invariant(_input);
 
     Value startingValue =
         _params.startWith->evaluate(*_input, &pExpCtx->variables, _expressionEvalCtx);
+
+    if (_params.coveredWalk && coveredWalk(startingValue)) {
+        return;
+    }
 
     // If _startWith evaluates to an array, treat each value as a separate starting point.
     _queue.clear();

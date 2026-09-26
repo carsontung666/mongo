@@ -108,6 +108,18 @@ public:
     query_shape::CollectionType getCollectionType(OperationContext* opCtx,
                                                   const NamespaceString& nss) override;
 
+    boost::optional<std::vector<Value>> graphLookupCoveredWalk(
+        OperationContext* opCtx,
+        const NamespaceString& from,
+        const BSONObj& equalities,
+        std::string_view connectToField,
+        std::string_view connectFromField,
+        std::string_view outputField,
+        const std::vector<Value>& startValues,
+        boost::optional<long long> maxDepth,
+        int64_t maxMemoryBytes,
+        PlanSummaryStats* stats) override;
+
     std::unique_ptr<Pipeline> attachCursorSourceToPipelineForLocalReadWithCatalog(
         std::unique_ptr<Pipeline> pipeline,
         const MultipleCollectionAccessor& collections,

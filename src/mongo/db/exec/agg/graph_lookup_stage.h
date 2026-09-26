@@ -91,6 +91,12 @@ private:
      */
     void performSearch();
 
+    /**
+     * Runs the search as a covered index walk into '_coveredAs'. Returns false if the walk cannot
+     * answer exactly.
+     */
+    bool coveredWalk(const Value& startingValue);
+
     void updateSpillingStats();
 
     void spillDuringVisitedUnwinding();
@@ -222,6 +228,9 @@ private:
     // If we absorbed a $unwind that specified 'includeArrayIndex', this is used to populate that
     // field, tracking how many results we've returned so far for the current input document.
     long long _outputIndex = 0;
+
+    // The 'as' array from the covered walk for the current input, if it ran.
+    boost::optional<MemoryUsageTokenWithImpl<MemoryUsageTracker, Value>> _coveredAs;
 
     // An internal struct for sharing container state between multiple queries that can be executed
     // by the graph lookup stage. The containers used in here are referenced by the 'Query'

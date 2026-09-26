@@ -9,6 +9,7 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/pipeline/document_source_graph_lookup_gen.h"
 #include "mongo/db/pipeline/document_source_hybrid_scoring_util.h"
@@ -20,6 +21,7 @@
 #include "mongo/db/pipeline/pipeline_factory.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/sort_reorder_helpers.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
@@ -174,9 +176,82 @@ StageConstraints DocumentSourceGraphLookUp::constraints(PipelineSplitState pipeS
     return constraints;
 }
 
+namespace {
+// restrictSearchWithMatch as {field: value}, if it is only {field: v} or {field: {$eq: v}} terms
+// that an index equality seek matches exactly.
+boost::optional<BSONObj> equalityFilter(const boost::optional<BSONObj>& filter) {
+    BSONObjBuilder equalities;
+    for (auto&& e : filter.value_or(BSONObj())) {
+        if (e.fieldNameStringData().starts_with('$')) {
+            return boost::none;
+        }
+        auto value = e;
+        if (e.type() == BSONType::object) {
+            auto obj = e.Obj();
+            if (obj.nFields() != 1 || obj.firstElementFieldNameStringData() != "$eq") {
+                return boost::none;
+            }
+            value = obj.firstElement();
+        }
+        if (value.type() == BSONType::array || value.type() == BSONType::regEx) {
+            return boost::none;
+        }
+        equalities.appendAs(value, e.fieldNameStringData());
+    }
+    return equalities.obj();
+}
+}  // namespace
+
+boost::optional<GraphLookUpParams::CoveredWalk> DocumentSourceGraphLookUp::findCoveredWalk(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) const {
+    if (!internalQueryEnableGraphLookupCoveredWalk.load() || _fromExpCtx->getInRouter() ||
+        _unwind || _params.depthField || _fromExpCtx->getCollator() ||
+        _params.connectToField.getPathLength() != 1 ||
+        _params.connectFromField.getPathLength() != 1 ||
+        !_params.fromLpp->pipeline().getStages().empty()) {
+        return boost::none;
+    }
+    auto equalities = equalityFilter(_params.additionalFilter);
+    if (!equalities) {
+        return boost::none;
+    }
+
+    // The rest of the pipeline may read only one '<as>.<field>' path of 'as'.
+    const auto deps = Pipeline::getDependenciesForContainer(
+        getExpCtx(),
+        DocumentSourceContainer{std::next(itr), container->end()},
+        DepsTracker::NoMetadataValidation());
+    if (deps.needWholeDocument) {
+        return boost::none;
+    }
+    const auto& as = _params.as.fullPath();
+    boost::optional<std::string> field;
+    for (const auto& path : deps.fields) {
+        if (path == as || expression::isPathPrefixOf(path, as)) {
+            return boost::none;
+        }
+        if (!expression::isPathPrefixOf(as, path)) {
+            continue;
+        }
+        auto sub = path.substr(as.size() + 1);
+        // A numeric component may be an array position.
+        if (sub.find_first_not_of("0123456789") == std::string::npos ||
+            sub.find('.') != std::string::npos || (field && *field != sub)) {
+            return boost::none;
+        }
+        field = std::move(sub);
+    }
+    if (!field) {
+        return boost::none;
+    }
+    return GraphLookUpParams::CoveredWalk{std::move(*field), std::move(*equalities)};
+}
+
 DocumentSourceContainer::iterator DocumentSourceGraphLookUp::optimizeAt(
     DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
     tassert(11294801, "Expecting DocumentSource iterator pointing to this stage", *itr == this);
+
+    _params.coveredWalk = findCoveredWalk(itr, container);
 
     if (std::next(itr) == container->end()) {
         return container->end();

@@ -1461,6 +1461,9 @@ struct DocumentSourceGraphLookupStats : public SpecificStats {
     // The peak amount of RAM used by the stage during execution.
     uint64_t maxMemoryUsageBytes = 0;
 
+    // Searches served by the covered index walk instead of the subpipeline.
+    uint64_t coveredWalks = 0;
+
     SpillingStats spillingStats;
 
     // Tracks the summary stats in aggregate across all executions of the subpipeline.

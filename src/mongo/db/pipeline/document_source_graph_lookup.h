@@ -55,6 +55,14 @@ struct GraphLookUpParams {
     boost::optional<OwnedLiteParsedPipeline>
         fromLpp;  // Always set after construction: the resolved view definition(s) for 'from', or
                   // an empty pipeline for a regular collection.
+
+    // Set by optimizeAt() when the covered tree walk may run: 'as' elements then only need
+    // 'field', and 'equalities' is restrictSearchWithMatch as {field: value}.
+    struct CoveredWalk {
+        std::string field;
+        BSONObj equalities;
+    };
+    boost::optional<CoveredWalk> coveredWalk;
 };
 
 class DocumentSourceGraphLookUp final : public DocumentSource {
@@ -218,6 +226,9 @@ private:
      * Returns true if we are not in a transaction.
      */
     bool foreignShardedGraphLookupAllowed() const;
+
+    boost::optional<GraphLookUpParams::CoveredWalk> findCoveredWalk(
+        DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) const;
 
     GraphLookUpParams _params;
 
