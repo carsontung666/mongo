@@ -1605,10 +1605,9 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
             }
             invariant(toPos >= 0 && fromPos >= 0 && outPos >= 0);
 
-            // The KeyString of the key prefix with connectTo = 'connectTo'. KeyString element
-            // encodings are prefix-free, so an index key starts with these bytes exactly when its
-            // first 'prefixLen' fields equal the prefix values. Equal bytes mean equal values
-            // under the simple collation, so the bytes also identify a queried connectFrom value.
+            // The KeyString of the key prefix with connectTo = 'connectTo'. Equal bytes mean equal
+            // values under the simple collation, so the bytes also identify a queried connectFrom
+            // value. See 'continuation' for how keys are matched against these bytes.
             key_string::Builder prefixBuilder(version);
             auto encodePrefix = [&](const BSONElement& connectTo) {
                 prefixBuilder.resetToEmpty(ordering);
@@ -1669,13 +1668,36 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
                     opCtx->checkForInterrupt();
                 }
             };
+            // Keys sort by their bytes, but one string's encoding can be a byte prefix of
+            // another's: "a" is 3C 61 00 and "a\0x" is 3C 61 00 FF 78 00, as a NUL is escaped as
+            // 00 FF (FF 00 in a descending field). In a key whose leading fields equal a prefix's
+            // values, the byte after the prefix starts the next field or ends the key, and is
+            // never 00 or FF. So bytes that go on past a prefix with 00 belong to a longer string
+            // and sort before all of the prefix's keys; with FF, after them. This returns <0, 0 or
+            // >0 for such a byte.
+            auto continuation = [](char next) {
+                const auto byte = static_cast<unsigned char>(next);
+                return byte == 0x00 ? -1 : byte == 0xFF ? 1 : 0;
+            };
             // <0, 0 or >0 as the current key sorts before, within or after the keys that start
             // with 'keyPrefix'.
             auto compareToPrefix = [&](std::span<const char> keyPrefix) {
                 const auto key = view.getKeyStringWithoutRecordIdView();
                 const int c =
                     memcmp(key.data(), keyPrefix.data(), std::min(key.size(), keyPrefix.size()));
-                return c != 0 ? c : (key.size() < keyPrefix.size() ? -1 : 0);
+                if (c != 0 || key.size() == keyPrefix.size()) {
+                    return c;
+                }
+                return key.size() < keyPrefix.size() ? -1 : continuation(key[keyPrefix.size()]);
+            };
+            // Orders key prefixes as their keys sort in the index.
+            auto prefixLess = [&](std::string_view a, std::string_view b) {
+                const int c = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
+                if (c != 0 || a.size() == b.size()) {
+                    return c < 0;
+                }
+                return a.size() < b.size() ? continuation(b[a.size()]) > 0
+                                           : continuation(a[b.size()]) < 0;
             };
 
             // Decodes the current key into 'keyFields', which stay valid until the next decode.
@@ -1751,8 +1773,8 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
             size_t lastFrontierSize = 0, lastLevelResults = 0;
             for (long long depth = 0; !frontier.empty(); ++depth) {
                 const bool expand = !maxDepth || depth < *maxDepth;
-                if (!std::is_sorted(frontier.begin(), frontier.end())) {
-                    std::sort(frontier.begin(), frontier.end());
+                if (!std::is_sorted(frontier.begin(), frontier.end(), prefixLess)) {
+                    std::sort(frontier.begin(), frontier.end(), prefixLess);
                 }
                 if (lastFrontierSize > 0) {
                     results.reserve(results.size() +

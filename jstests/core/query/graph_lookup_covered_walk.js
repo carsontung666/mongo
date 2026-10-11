@@ -312,3 +312,34 @@ for (const extra of [[], [{tree_id: kTreeId, parent_id: "n9", path: "/n9/x"}]]) 
         }
     }
 }
+
+// A string's KeyString can be a byte prefix of a longer string's: "a" is a prefix of "a\0x". Keys
+// of the longer string must not be read as the shorter one's, in either index direction, for
+// connectTo and for an equality field that ends the key prefix.
+{
+    const node = (id, parent, tree = kTreeId) => ({tree_id: tree, node_id: id, parent_id: parent});
+    const cases = [
+        [node("a", "r"), node("f", "a\u0000x")],
+        [node("a", "r"), node("a\u0000", "r"), node("q", "a\u0000")],
+        [node("a", "r"), node("q", "a\u0000"), node("b", "a"), node("a\u0000", "b")],
+        [node("a", "r"), node("a\u0000", "a"), node("b", "a\u0000"), node("c", "a\u0000\u0000")],
+        [node("a", "r"), node("b", "a", "t\u0000"), node("c", "a", kTreeId + "\u0000")],
+    ];
+    const indexes = [
+        {tree_id: 1, parent_id: 1, node_id: 1},
+        {tree_id: 1, parent_id: -1, node_id: 1},
+        {parent_id: 1, tree_id: 1, node_id: 1},
+        {parent_id: -1, tree_id: -1, node_id: 1},
+    ];
+    cases.forEach((docs, i) => {
+        indexes.forEach((index, j) => {
+            const coll = makeColl(`_nul_${i}_${j}`, [node("r", null), ...docs]);
+            assert.commandWorked(coll.dropIndex(kIndex));
+            assert.commandWorked(coll.createIndex(index));
+            for (const maxDepth of [0, 1, 5]) {
+                const pipeline = descendants(coll, "r", {maxDepth});
+                assertParity(coll, pipeline, runWithGate(false, coll, pipeline));
+            }
+        });
+    });
+}
