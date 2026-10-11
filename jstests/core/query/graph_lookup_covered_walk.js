@@ -240,3 +240,75 @@ for (const extra of [[], [{tree_id: kTreeId, parent_id: "n9", path: "/n9/x"}]]) 
         {ids: ["n1", "n2", "n3", "n3", "n4"]},
     ]);
 }
+
+// An index {tree_id, parent_id, node_id}: connectFrom and the output field follow the key prefix.
+{
+    const kAdjacency = {tree_id: 1, parent_id: 1, node_id: 1};
+    const makeAdjacency = (suffix, docs) => {
+        const coll = makeColl(suffix, docs);
+        assert.commandWorked(coll.dropIndex(kIndex));
+        assert.commandWorked(coll.createIndex(kAdjacency));
+        return coll;
+    };
+    const node = (id, parent, tree = kTreeId) => ({tree_id: tree, node_id: id, parent_id: parent});
+
+    // Strings with NULs, long and non-ASCII strings, numbers, a cycle, a node with two parents, a
+    // second tree, and children far apart in the index.
+    const docs = [node("r", null), node("r", null, "t1"), node("x", "r", "t1")];
+    for (let i = 0; i < 40; ++i) {
+        docs.push(node("c" + i, "r"));
+        docs.push(node("filler" + i, "elsewhere"));
+    }
+    docs.push(
+        node("a\u0000b", "c0"),
+        node("leaf", "a\u0000b"),
+        node("a very long node identifier", "c1"),
+        node("ünïcødé", "a very long node identifier"),
+        node(NumberInt(7), "c2"),
+        node("seven", 7.0),
+        node("loop", "c3"),
+        node("c3", "loop"),
+        node("shared", "c4"),
+        node("shared", "c5"),
+        node("under shared", "shared"),
+        node("deep", "c39"),
+    );
+    const coll = makeAdjacency("_adjacency", docs);
+    for (const maxDepth of [0, 1, 2, 5]) {
+        const pipeline = descendants(coll, "r", {maxDepth});
+        assertParity(coll, pipeline, runWithGate(false, coll, pipeline));
+    }
+    assertParity(coll, descendants(coll, "r", {maxDepth: 1}), [
+        {ids: [...docs.slice(3).filter((d) => d.parent_id === "r").map((d) => d.node_id),
+               "a\u0000b", "a very long node identifier", NumberInt(7), "loop", "shared", "shared",
+               "deep"]},
+    ]);
+
+    // The $project that follows reads '$desc.node_id' in several ways.
+    const tails = [
+        [{$project: {_id: 0, ids: "$desc.node_id"}}],
+        [{$project: {_id: 0, ids: "$desc.node_id", nested: {n: {$size: "$desc.node_id"}}}}],
+        [{$project: {_id: 0, desc: "$desc.node_id"}}],
+        [{$project: {_id: 0, first: {$min: "$desc.node_id"}, node_id: 1}}],
+        // An inclusion of 'desc.node_id' keeps 'desc' documents.
+        [{$project: {_id: 0, "desc.node_id": 1}}],
+        [{$addFields: {ids: "$desc.node_id"}}, {$project: {_id: 0, ids: 1}}],
+        [{$project: {_id: 0, ids: "$desc.node_id"}}, {$project: {n: {$size: "$ids"}}}],
+    ];
+    for (const tail of tails) {
+        const pipeline = descendants(coll, "r", {maxDepth: 5}, tail);
+        assertParity(coll, pipeline, runWithGate(false, coll, pipeline));
+    }
+
+    // The walk gives up at run time but the $project still reads '$desc': a null node_id, and a
+    // collection without a usable index.
+    const withNull = makeAdjacency("_adjacency_null", [node("r", null), node("a", "r"), node(null, "a")]);
+    const noIndex = makeColl("_adjacency_noindex", [node("r", null), node("a", "r"), node("b", "a")]);
+    assert.commandWorked(noIndex.dropIndex(kIndex));
+    for (const c of [withNull, noIndex]) {
+        for (const tail of tails) {
+            const pipeline = descendants(c, "r", {maxDepth: 5}, tail);
+            assertParity(c, pipeline, runWithGate(false, c, pipeline));
+        }
+    }
+}

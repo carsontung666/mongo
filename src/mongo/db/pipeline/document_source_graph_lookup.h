@@ -61,6 +61,10 @@ struct GraphLookUpParams {
     struct CoveredWalk {
         std::string field;
         BSONObj equalities;
+        // Set when the next stage is an inclusion $project that reads 'as' only through
+        // '$<as>.<field>', and has been rewritten to read '$<as>' instead. 'as' then holds the
+        // '<field>' values, which is what '$<as>.<field>' evaluates to on the documents.
+        bool asFieldValues = false;
     };
     boost::optional<CoveredWalk> coveredWalk;
 };
@@ -226,6 +230,12 @@ private:
      * Returns true if we are not in a transaction.
      */
     bool foreignShardedGraphLookupAllowed() const;
+
+    /**
+     * If the stage after 'itr' is an inclusion $project that reads 'as' only through
+     * '$<as>.<field>', rewrites it to read '$<as>' and sets 'asFieldValues'.
+     */
+    void rewriteProjectToReadFieldValues(DocumentSourceContainer::iterator itr);
 
     boost::optional<GraphLookUpParams::CoveredWalk> findCoveredWalk(
         DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) const;

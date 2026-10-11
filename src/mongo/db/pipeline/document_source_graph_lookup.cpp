@@ -9,10 +9,12 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/inclusion_projection_executor.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/pipeline/document_source_graph_lookup_gen.h"
 #include "mongo/db/pipeline/document_source_hybrid_scoring_util.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_builder.h"
@@ -247,11 +249,51 @@ boost::optional<GraphLookUpParams::CoveredWalk> DocumentSourceGraphLookUp::findC
     return GraphLookUpParams::CoveredWalk{std::move(*field), std::move(*equalities)};
 }
 
+void DocumentSourceGraphLookUp::rewriteProjectToReadFieldValues(
+    DocumentSourceContainer::iterator itr) {
+    // The rewritten $project must stay paired with this stage, so only rewrite a pipeline that
+    // runs here in full.
+    const auto& expCtx = getExpCtx();
+    if (expCtx->getInRouter() || expCtx->getFromRouter() || expCtx->getNeedsMerge() ||
+        _params.as.getPathLength() != 1) {
+        return;
+    }
+    auto* project =
+        dynamic_cast<DocumentSourceSingleDocumentTransformation*>(std::next(itr)->get());
+    if (!project ||
+        project->getTransformerType() !=
+            TransformerInterface::TransformerType::kInclusionProjection) {
+        return;
+    }
+    auto& root =
+        *static_cast<projection_executor::InclusionProjectionExecutor&>(project->getTransformer())
+             .getRoot();
+    // The $project drops 'as' unless it includes a path in it. findCoveredWalk() checked that
+    // only '<as>.<field>' is read, so the rest of the pipeline cannot see the rewritten 'as'.
+    const auto& as = _params.as.fullPath();
+    OrderedPathSet included;
+    root.reportProjectedPaths(&included);
+    for (const auto& path : included) {
+        if (path == as || expression::isPathPrefixOf(path, as) ||
+            expression::isPathPrefixOf(as, path)) {
+            return;
+        }
+    }
+    root.substituteFieldPathsInExpressions({{as + "." + _params.coveredWalk->field, as}});
+    _params.coveredWalk->asFieldValues = true;
+}
+
 DocumentSourceContainer::iterator DocumentSourceGraphLookUp::optimizeAt(
     DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
     tassert(11294801, "Expecting DocumentSource iterator pointing to this stage", *itr == this);
 
-    _params.coveredWalk = findCoveredWalk(itr, container);
+    // Once the next $project reads the '<field>' values, 'as' must keep holding them.
+    if (!_params.coveredWalk || !_params.coveredWalk->asFieldValues) {
+        _params.coveredWalk = findCoveredWalk(itr, container);
+        if (_params.coveredWalk && std::next(itr) != container->end()) {
+            rewriteProjectToReadFieldValues(itr);
+        }
+    }
 
     if (std::next(itr) == container->end()) {
         return container->end();

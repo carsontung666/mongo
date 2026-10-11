@@ -106,6 +106,12 @@ public:
     void reportProjectedPaths(OrderedPathSet* preservedPaths) const;
 
     /**
+     * Recursively replaces each field path in this projection's expressions that starts with a
+     * key of 'renames' by the corresponding value, as SubstituteFieldPathWalker does.
+     */
+    void substituteFieldPathsInExpressions(const StringMap<std::string>& renames);
+
+    /**
      * Return an optional number, x, which indicates that it is safe to stop reading the document
      * being projected once x fields have been projected.
      */

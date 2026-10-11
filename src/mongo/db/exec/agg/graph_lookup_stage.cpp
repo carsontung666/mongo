@@ -169,13 +169,23 @@ GetNextResult GraphLookUpStage::doGetNext() {
     };
 
     uassertTotalSize();
+    // With 'asFieldValues', 'as' holds what '$<as>.<field>' evaluates to on the documents: the
+    // '<field>' value of each document that has one.
+    const bool asFieldValues = _params.coveredWalk && _params.coveredWalk->asFieldValues;
     std::vector<Value> results;
     results.reserve(_visitedDocuments.size());
     for (auto it = _visitedDocuments.begin(); it != _visitedDocuments.end();
          _visitedDocuments.eraseIfInMemoryAndAdvance(it)) {
         totalSize += it->getApproximateSize();
         uassertTotalSize();
-        results.emplace_back(std::move(*it));
+        if (asFieldValues) {
+            if (auto value = it->getField(std::string_view(_params.coveredWalk->field));
+                !value.missing()) {
+                results.push_back(std::move(value));
+            }
+        } else {
+            results.emplace_back(std::move(*it));
+        }
     }
     _visitedDocuments.clear();
 
@@ -292,11 +302,18 @@ bool GraphLookUpStage::coveredWalk(const Value& startingValue) {
         return false;
     }
     std::vector<Value> as;
-    as.reserve(values->size());
     int64_t bytes = 0;
-    for (auto& v : *values) {
-        as.emplace_back(Document{{_params.coveredWalk->field, std::move(v)}});
-        bytes += as.back().getApproximateSize();
+    if (_params.coveredWalk->asFieldValues) {
+        for (const auto& v : *values) {
+            bytes += v.getApproximateSize();
+        }
+        as = std::move(*values);
+    } else {
+        as.reserve(values->size());
+        for (auto& v : *values) {
+            as.emplace_back(Document{{_params.coveredWalk->field, std::move(v)}});
+            bytes += as.back().getApproximateSize();
+        }
     }
     _coveredAs.emplace(MemoryUsageTokenImpl<MemoryUsageTracker>(bytes, &_memoryUsageTracker),
                        std::move(as));

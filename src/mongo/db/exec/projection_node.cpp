@@ -5,6 +5,7 @@
 
 #include "mongo/bson/bsontypes.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_walker.h"
 #include "mongo/db/query/compiler/dependency_analysis/document_transformation_helpers.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -334,6 +335,19 @@ void ProjectionNode::optimize() {
     }
 
     _maxFieldsToProject = maxFieldsToProject().value_or(kUnlimitedFieldsToProject);
+}
+
+void ProjectionNode::substituteFieldPathsInExpressions(const StringMap<std::string>& renames) {
+    SubstituteFieldPathWalker walker(renames);
+    for (auto&& expressionPair : _expressions) {
+        if (auto substituted =
+                expression_walker::walk<Expression>(expressionPair.second.get(), &walker)) {
+            expressionPair.second = substituted.release();
+        }
+    }
+    for (auto&& childPair : _children) {
+        childPair.second->substituteFieldPathsInExpressions(renames);
+    }
 }
 
 Document ProjectionNode::serialize(const query_shape::SerializationOptions& options) const {

@@ -18,12 +18,10 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/agg/pipeline_builder.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/exec/matcher/matcher.h"
 #include "mongo/db/flow_control_ticketholder.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index_names.h"
-#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/catalog_resource_handle.h"
@@ -86,7 +84,6 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/exceptions.h"
-#include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/mdb_catalog.h"
 #include "mongo/db/storage/record_data.h"
@@ -1472,25 +1469,10 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(throwWriteConflictInGraphLookupCoveredWalk);
 
-Value valueFromDehydratedKey(const BSONObj& keyPattern,
-                             const BSONObj& dehydrated,
-                             std::string_view field) {
-    BSONObjIterator names(keyPattern);
-    BSONObjIterator values(dehydrated);
-    while (names.more() && values.more()) {
-        auto n = names.next();
-        auto v = values.next();
-        if (n.fieldNameStringData() == field) {
-            return Value(v);
-        }
-    }
-    return Value();
-}
-
 // Whether an equality seek on 'v' finds what {connectTo: {$in: [v]}} finds. A regex matches by
 // pattern, and an object may parse as an operator. The caller handles null and missing.
-bool seekMatchesInQuery(const Value& v) {
-    switch (v.getType()) {
+bool seekMatchesInQuery(BSONType type) {
+    switch (type) {
         case BSONType::undefined:
         case BSONType::regEx:
         case BSONType::array:
@@ -1546,24 +1528,6 @@ const IndexCatalogEntry* findEqualityPrefixIndex(OperationContext* opCtx,
     return nullptr;
 }
 
-// The index key prefix fixed by 'equalities' and connectTo = 'connectToValue'.
-BSONObj equalityPrefix(const BSONObj& keyPattern,
-                       const BSONObj& equalities,
-                       std::string_view connectToField,
-                       const Value& connectToValue) {
-    BSONObjBuilder prefix;
-    BSONObjIterator kpIt(keyPattern);
-    for (int i = 0; i <= equalities.nFields(); ++i) {
-        const auto name = kpIt.next().fieldNameStringData();
-        if (name == connectToField) {
-            connectToValue.addToBsonObj(&prefix, name);
-        } else {
-            prefix.appendAs(equalities[name], name);
-        }
-    }
-    return prefix.obj();
-}
-
 }  // namespace
 
 boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCoveredWalk(
@@ -1578,7 +1542,7 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
     int64_t maxMemoryBytes,
     PlanSummaryStats* stats) {
     for (const auto& s : startValues) {
-        if (!seekMatchesInQuery(s)) {
+        if (!seekMatchesInQuery(s.getType())) {
             return boost::none;
         }
     }
@@ -1612,76 +1576,244 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
             }
 
             const BSONObj keyPattern = indexEntry->descriptor()->keyPattern();
-            const KeyPattern kp(keyPattern);
             auto* iam = indexEntry->accessMethod()->asSortedData();
-            auto cursor = iam->newCursor(opCtx, ru, true /* forward */);
             const auto* sdi = iam->getSortedDataInterface();
-            key_string::Builder builder(sdi->getKeyStringVersion());
-            auto seek = [&](const Value& connectTo) {
-                opCtx->checkForInterrupt();
-                const auto prefix =
-                    equalityPrefix(keyPattern, equalities, connectToField, connectTo);
-                cursor->setEndPosition(Helpers::toKeyFormat(kp.extendRangeBound(prefix, true)),
-                                       true /* inclusive */);
-                return cursor->seek(ru,
-                                    IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
-                                        Helpers::toKeyFormat(kp.extendRangeBound(prefix, false)),
-                                        sdi->getOrdering(),
-                                        true /* forward */,
-                                        true /* inclusive */,
-                                        builder),
-                                    SortedDataInterface::Cursor::KeyInclusion::kInclude);
+            const Ordering ordering = sdi->getOrdering();
+            const auto version = sdi->getKeyStringVersion();
+
+            // The first 'prefixLen' key fields are the equality fields and connectTo, in key
+            // pattern order. 'prefixValues' holds the equality values; the connectTo slot is empty.
+            const int prefixLen = equalities.nFields() + 1;
+            std::vector<BSONElement> prefixValues;
+            int toPos = -1, fromPos = -1, outPos = -1, pos = 0;
+            for (auto&& e : keyPattern) {
+                const auto name = e.fieldNameStringData();
+                if (pos < prefixLen) {
+                    if (name == connectToField) {
+                        toPos = pos;
+                    }
+                    prefixValues.push_back(name == connectToField ? BSONElement()
+                                                                  : equalities[name]);
+                }
+                if (name == connectFromField) {
+                    fromPos = pos;
+                }
+                if (name == outputField) {
+                    outPos = pos;
+                }
+                ++pos;
+            }
+            invariant(toPos >= 0 && fromPos >= 0 && outPos >= 0);
+
+            // The KeyString of the key prefix with connectTo = 'connectTo'. KeyString element
+            // encodings are prefix-free, so an index key starts with these bytes exactly when its
+            // first 'prefixLen' fields equal the prefix values. Equal bytes mean equal values
+            // under the simple collation, so the bytes also identify a queried connectFrom value.
+            key_string::Builder prefixBuilder(version);
+            auto encodePrefix = [&](const BSONElement& connectTo) {
+                prefixBuilder.resetToEmpty(ordering);
+                for (int i = 0; i < prefixLen; ++i) {
+                    prefixBuilder.appendBSONElement(i == toPos ? connectTo : prefixValues[i]);
+                }
+                return prefixBuilder.getView();
             };
 
+            // The usual layout is {<equalities>, connectTo, connectFrom, ...} with connectFrom as
+            // the output field, both ascending. Then a key with no type bits whose connectFrom is a
+            // string without NULs needs no decoding: the string follows the key prefix, and the
+            // next level's key prefix is the equality bytes plus the string's own bytes.
+            const bool fastLayout = outPos == fromPos && outPos == prefixLen &&
+                toPos == prefixLen - 1 && ordering.get(toPos) == 1 && ordering.get(outPos) == 1;
+            std::string equalityBytes;
+            char stringCType = 0;
+            if (fastLayout) {
+                prefixBuilder.resetToEmpty(ordering);
+                for (int i = 0; i < toPos; ++i) {
+                    prefixBuilder.appendBSONElement(prefixValues[i]);
+                }
+                equalityBytes.assign(prefixBuilder.getView().data(),
+                                     prefixBuilder.getView().size());
+                key_string::Builder probe(version);
+                probe.appendString(std::string_view("a"));
+                stringCType = probe.getView()[0];
+            }
+            // The string at 'begin' if it is one without NULs; a NUL is escaped as 0x00 0xFF.
+            auto readPlainString = [&](const char* begin,
+                                       const char* end) -> boost::optional<std::string_view> {
+                if (begin == end || *begin != stringCType) {
+                    return boost::none;
+                }
+                const auto* nul = static_cast<const char*>(memchr(begin + 1, 0, end - begin - 1));
+                if (!nul || (nul + 1 < end && static_cast<unsigned char>(nul[1]) == 0xFF)) {
+                    return boost::none;
+                }
+                return std::string_view(begin + 1, nul - begin - 1);
+            };
+
+            auto cursor = iam->newCursor(opCtx, ru, true /* forward */);
+            key_string::Builder seekBuilder(version);
             size_t keysExamined = 0;
             ON_BLOCK_EXIT([&] { stats->totalKeysExamined += keysExamined; });
+            SortedDataKeyValueView view;
+            auto seek = [&](std::span<const char> keyPrefix) {
+                opCtx->checkForInterrupt();
+                seekBuilder.resetToEmpty(key_string::ALL_ASCENDING,
+                                         key_string::Discriminator::kExclusiveBefore);
+                seekBuilder.appendBytes(keyPrefix.data(), keyPrefix.size());
+                view = cursor->seekForKeyValueView(ru, seekBuilder.finishAndGetBuffer());
+                keysExamined += !view.isEmpty();
+            };
+            auto advance = [&] {
+                view = cursor->nextKeyValueView(ru);
+                if (!view.isEmpty() && ++keysExamined % 128 == 0) {
+                    opCtx->checkForInterrupt();
+                }
+            };
+            // <0, 0 or >0 as the current key sorts before, within or after the keys that start
+            // with 'keyPrefix'.
+            auto compareToPrefix = [&](std::span<const char> keyPrefix) {
+                const auto key = view.getKeyStringWithoutRecordIdView();
+                const int c =
+                    memcmp(key.data(), keyPrefix.data(), std::min(key.size(), keyPrefix.size()));
+                return c != 0 ? c : (key.size() < keyPrefix.size() ? -1 : 0);
+            };
+
+            // Decodes the current key into 'keyFields', which stay valid until the next decode.
+            BufBuilder keyBuffer;
+            std::vector<BSONElement> keyFields(keyPattern.nFields());
+            auto decode = [&] {
+                keyBuffer.reset();
+                BSONObjBuilder keyBuilder(keyBuffer);
+                BufReader typeBitsBuffer(view.getTypeBitsView().data(),
+                                         view.getTypeBitsView().size());
+                auto typeBits =
+                    key_string::TypeBits::getReaderFromBuffer(view.getVersion(), &typeBitsBuffer);
+                key_string::toBsonSafe(
+                    view.getKeyStringWithoutRecordIdView(), ordering, typeBits, keyBuilder);
+                keyBuilder.done();
+                BSONObjIterator it(BSONObj(keyBuffer.buf()));
+                for (auto& field : keyFields) {
+                    field = it.next();
+                }
+            };
 
             // Like the subpipeline search, query each connectFrom value once. The index is not
-            // multikey, so each document has one connectTo value and is found at most once.
-            const ValueComparator valueCmp;
-            auto visited = valueCmp.makeFlatUnorderedValueSet();
-            std::vector<Value> frontier;
+            // multikey, so each document has one connectTo value and is found at most once. The
+            // visited set and the frontier hold views of the key prefixes to query, which are
+            // stored in 'prefixBlocks' and never move.
+            std::vector<std::unique_ptr<char[]>> prefixBlocks;
+            char* prefixFree = nullptr;
+            size_t prefixFreeBytes = 0;
+            StringDataSet visited;
+            std::vector<std::string_view> frontier;
             int64_t memoryBytes = 0;
+            auto enqueuePrefix = [&](std::string_view keyPrefix,
+                                     std::vector<std::string_view>* out) {
+                if (visited.contains(keyPrefix)) {
+                    return;
+                }
+                if (keyPrefix.size() > prefixFreeBytes) {
+                    prefixFreeBytes = std::max<size_t>(64 * 1024, keyPrefix.size());
+                    prefixBlocks.emplace_back(new char[prefixFreeBytes]);
+                    prefixFree = prefixBlocks.back().get();
+                }
+                memcpy(prefixFree, keyPrefix.data(), keyPrefix.size());
+                const std::string_view stored(prefixFree, keyPrefix.size());
+                prefixFree += stored.size();
+                prefixFreeBytes -= stored.size();
+                visited.insert(stored);
+                memoryBytes += stored.size();
+                out->push_back(stored);
+            };
+            auto enqueue = [&](const BSONElement& connectFrom, std::vector<std::string_view>* out) {
+                const auto keyPrefix = encodePrefix(connectFrom);
+                enqueuePrefix(std::string_view(keyPrefix.data(), keyPrefix.size()), out);
+            };
+            std::string childPrefix;
             // A null value is queried with {$exists: true}, which a null index key cannot check.
             bool nullOnFrontier = false;
             for (const auto& s : startValues) {
                 if (s.getType() == BSONType::null) {
                     nullOnFrontier = true;
-                } else if (!s.missing() && visited.insert(s).second) {
-                    memoryBytes += s.getApproximateSize();
-                    frontier.push_back(s);
+                } else if (!s.missing()) {
+                    BSONObjBuilder holder;
+                    s.addToBsonObj(&holder, "");
+                    enqueue(holder.done().firstElement(), &frontier);
                 }
             }
 
+            // Each level queries its frontier in key order as one forward merge over the index:
+            // the cursor steps from one prefix's keys to the next instead of seeking for each,
+            // and seeks only past a gap of more than a few keys.
+            constexpr int kStepsBeforeSeek = 8;
             std::vector<Value> results;
-            const bool outputIsFrom = outputField == connectFromField;
+            // Sizes the results for each level by the previous level's fanout.
+            size_t lastFrontierSize = 0, lastLevelResults = 0;
             for (long long depth = 0; !frontier.empty(); ++depth) {
                 const bool expand = !maxDepth || depth < *maxDepth;
-                std::vector<Value> next;
-                for (const auto& parent : frontier) {
-                    for (auto entry = seek(parent); entry;
-                         entry = cursor->next(
-                             ru, SortedDataInterface::Cursor::KeyInclusion::kInclude)) {
-                        if (++keysExamined % 128 == 0) {
-                            opCtx->checkForInterrupt();
+                if (!std::is_sorted(frontier.begin(), frontier.end())) {
+                    std::sort(frontier.begin(), frontier.end());
+                }
+                if (lastFrontierSize > 0) {
+                    results.reserve(results.size() +
+                                    frontier.size() * (lastLevelResults / lastFrontierSize + 1));
+                }
+                const size_t levelStart = results.size();
+                std::vector<std::string_view> next;
+                bool positioned = false;
+                for (const auto& keyPrefixView : frontier) {
+                    const std::span<const char> keyPrefix(keyPrefixView);
+                    if (!positioned) {
+                        seek(keyPrefix);
+                        positioned = true;
+                    } else {
+                        for (int steps = 0; !view.isEmpty() && compareToPrefix(keyPrefix) < 0;
+                             ++steps) {
+                            if (steps == kStepsBeforeSeek) {
+                                seek(keyPrefix);
+                                break;
+                            }
+                            advance();
                         }
-                        Value fromVal =
-                            valueFromDehydratedKey(keyPattern, entry->key, connectFromField);
-                        Value out = outputIsFrom
-                            ? fromVal
-                            : valueFromDehydratedKey(keyPattern, entry->key, outputField);
+                    }
+                    if (view.isEmpty()) {
+                        // The rest of the frontier sorts after the last key.
+                        break;
+                    }
+                    for (; !view.isEmpty() && compareToPrefix(keyPrefix) == 0; advance()) {
+                        if (fastLayout && view.getTypeBitsView().empty()) {
+                            const auto key = view.getKeyStringWithoutRecordIdView();
+                            const char* begin = key.data() + keyPrefix.size();
+                            if (auto str = readPlainString(begin, key.data() + key.size())) {
+                                if (expand) {
+                                    childPrefix.assign(equalityBytes);
+                                    childPrefix.append(begin, str->data() + str->size() + 1);
+                                    enqueuePrefix(childPrefix, &next);
+                                }
+                                results.emplace_back(*str);
+                                memoryBytes += sizeof(Value) + results.back().getApproximateSize();
+                                if (memoryBytes > maxMemoryBytes) {
+                                    return boost::none;
+                                }
+                                continue;
+                            }
+                        }
+                        decode();
+                        Value out(keyFields[outPos]);
                         // A null key may be a missing field, which '$as.field' skips.
                         if (out.nullish()) {
                             return boost::none;
                         }
                         memoryBytes += sizeof(Value) + out.getApproximateSize();
-                        if (expand && fromVal.getType() == BSONType::null) {
-                            nullOnFrontier = true;
-                        } else if (expand && !seekMatchesInQuery(fromVal)) {
-                            return boost::none;
-                        } else if (expand && visited.insert(fromVal).second) {
-                            memoryBytes += fromVal.getApproximateSize();
-                            next.push_back(std::move(fromVal));
+                        if (expand) {
+                            const auto& from = keyFields[fromPos];
+                            if (from.type() == BSONType::null) {
+                                nullOnFrontier = true;
+                            } else if (!seekMatchesInQuery(from.type())) {
+                                return boost::none;
+                            } else {
+                                enqueue(from, &next);
+                            }
                         }
                         if (memoryBytes > maxMemoryBytes) {
                             return boost::none;
@@ -1689,13 +1821,19 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
                         results.push_back(std::move(out));
                     }
                 }
+                lastFrontierSize = frontier.size();
+                lastLevelResults = results.size() - levelStart;
                 frontier = std::move(next);
             }
 
             // Null on the frontier (or a missing connectFrom, which is not expanded) changes
             // nothing only if no document has a null connectTo.
-            if (nullOnFrontier && seek(Value(BSONNULL))) {
-                return boost::none;
+            if (nullOnFrontier) {
+                const auto keyPrefix = encodePrefix(BSON("" << BSONNULL).firstElement());
+                seek(keyPrefix);
+                if (!view.isEmpty() && compareToPrefix(keyPrefix) == 0) {
+                    return boost::none;
+                }
             }
 
             const auto& indexName = indexEntry->descriptor()->indexName();
