@@ -284,6 +284,9 @@ GetNextResult GraphLookUpStage::getNextUnwound() {
 
 bool GraphLookUpStage::coveredWalk(const Value& startingValue) {
     auto opCtx = pExpCtx->getOperationContext();
+    const auto maxMemoryBytes = std::min(
+        _memoryUsageTracker.maxAllowedMemoryUsageBytes(opCtx),
+        static_cast<int64_t>(internalGraphLookupStageIntermediateDocumentMaxSizeBytes.load()));
     const std::vector<Value> one{startingValue};
     auto values = _fromExpCtx->getMongoProcessInterface()->graphLookupCoveredWalk(
         opCtx,
@@ -294,14 +297,13 @@ bool GraphLookUpStage::coveredWalk(const Value& startingValue) {
         _params.coveredWalk->field,
         startingValue.isArray() ? startingValue.getArray() : one,
         _params.maxDepth,
-        std::min(
-            _memoryUsageTracker.maxAllowedMemoryUsageBytes(opCtx),
-            static_cast<int64_t>(internalGraphLookupStageIntermediateDocumentMaxSizeBytes.load())),
+        maxMemoryBytes,
         &_stats.planSummaryStats);
     if (!values) {
         return false;
     }
     std::vector<Value> as;
+    // Each value's approximate size already includes its slot in the result array.
     int64_t bytes = 0;
     if (_params.coveredWalk->asFieldValues) {
         for (const auto& v : *values) {
@@ -313,7 +315,15 @@ bool GraphLookUpStage::coveredWalk(const Value& startingValue) {
         for (auto& v : *values) {
             as.emplace_back(Document{{_params.coveredWalk->field, std::move(v)}});
             bytes += as.back().getApproximateSize();
+            if (bytes > maxMemoryBytes) {
+                return false;
+            }
         }
+    }
+    // The walk budgets field values. Wrapping them in documents can exceed the stage's memory
+    // or intermediate output limit, so let the usual search enforce its spill/error behavior.
+    if (bytes > maxMemoryBytes) {
+        return false;
     }
     _coveredAs.emplace(MemoryUsageTokenImpl<MemoryUsageTracker>(bytes, &_memoryUsageTracker),
                        std::move(as));

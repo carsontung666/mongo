@@ -152,7 +152,11 @@ function run(coll, profileDB, pipeline, options = {}) {
     ]) {
         const {ids, docsExamined} = run(coll, db, p, options);
         assert.gt(docsExamined, 1, name);
-        assert.eq(["n1", "n2", "n3"], ids.filter((id) => typeof id === "string"), name);
+        assert.eq(
+            ["n1", "n2", "n3"],
+            ids.filter((id) => typeof id === "string"),
+            name,
+        );
     }
     for (const [name, p] of [
         ["regex startWith", pipeline(tree, {startWith: {$literal: /^n/}})],
@@ -190,7 +194,12 @@ function run(coll, profileDB, pipeline, options = {}) {
         db.createCollection("ts", {timeseries: {timeField: "t", metaField: "meta"}}),
     );
     const t = ISODate();
-    assert.commandWorked(db.ts.insert([{_id: 0, t, meta: "a"}, {_id: 1, t, meta: "a"}]));
+    assert.commandWorked(
+        db.ts.insert([
+            {_id: 0, t, meta: "a"},
+            {_id: 1, t, meta: "a"},
+        ]),
+    );
     const spec = {
         from: "ts",
         startWith: "a",
@@ -209,6 +218,42 @@ function run(coll, profileDB, pipeline, options = {}) {
 
     // The walk needs more than the memory limit, so the subpipeline search runs and fails.
     const kMemoryKnob = "internalDocumentSourceGraphLookupMaxMemoryBytes";
+    const memoryWrapping = makeColl(
+        db,
+        "memory_wrapping",
+        [
+            {_id: 0, tree_id: "t0", node_id: "r", parent_id: null},
+            ...Array.from({length: 10}, (_, i) => ({
+                _id: i + 1,
+                tree_id: "t0",
+                node_id: "c" + i,
+                parent_id: "r",
+            })),
+        ],
+        {tree_id: 1, parent_id: 1, node_id: 1},
+    );
+    // Without a rewritten $project, the walk wraps values in documents. Those documents must
+    // count toward the limit too, even when the raw values fit.
+    assert.commandWorked(db.adminCommand({setParameter: 1, [kMemoryKnob]: 512}));
+    assert.throwsWithCode(
+        () =>
+            memoryWrapping
+                .aggregate(
+                    pipeline(memoryWrapping, {maxDepth: 0}, [{$group: {_id: "$desc.node_id"}}]),
+                    {allowDiskUse: false},
+                )
+                .toArray(),
+        ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed,
+    );
+    const [spilled] = memoryWrapping
+        .aggregate(pipeline(memoryWrapping, {maxDepth: 0}, [{$group: {_id: "$desc.node_id"}}]), {
+            allowDiskUse: true,
+        })
+        .toArray();
+    assert.sameMembers(
+        Array.from({length: 10}, (_, i) => "c" + i),
+        spilled._id,
+    );
     assert.commandWorked(db.adminCommand({setParameter: 1, [kMemoryKnob]: 1}));
     assert.throwsWithCode(
         () => tree.aggregate(pipeline(tree), {allowDiskUse: false}).toArray(),
