@@ -107,7 +107,10 @@ public:
 
     /**
      * Recursively replaces each field path in this projection's expressions that starts with a
-     * key of 'renames' by the corresponding value, as SubstituteFieldPathWalker does.
+     * key of 'renames' by the corresponding value, as SubstituteFieldPathWalker does. The
+     * substitution is an execution-only rewrite: serialize() keeps emitting the expressions as
+     * they were before the first substitution, so a serialized pipeline stays equivalent to the
+     * one the user wrote.
      */
     void substituteFieldPathsInExpressions(const StringMap<std::string>& renames);
 
@@ -209,6 +212,11 @@ protected:
 
     StringMap<std::unique_ptr<ProjectionNode>> _children;
     StringMap<boost::intrusive_ptr<Expression>> _expressions;
+
+    // Clones of '_expressions' taken before the first substituteFieldPathsInExpressions() call,
+    // keyed as '_expressions'. serialize() emits these instead of the substituted expressions so
+    // an execution-only rewrite never leaks into explain output or a serialized pipeline.
+    StringMap<boost::intrusive_ptr<Expression>> _expressionsBeforeSubstitution;
 
     // List of the projected fields in the order in which they were specified.
     std::list<std::string> _projectedFields;

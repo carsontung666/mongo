@@ -9,6 +9,8 @@
  *   requires_timeseries,
  * ]
  */
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
 import {getAggPlanStages} from "jstests/libs/query/analyze_plan.js";
 import {ShardingTest} from "jstests/libs/shardingtest.js";
 
@@ -70,6 +72,22 @@ function run(coll, profileDB, pipeline, options = {}) {
     const explain = tree.explain("executionStats").aggregate(pipeline(tree));
     assert.eq(1, getAggPlanStages(explain, "$project").length);
     assert.eq(1, getAggPlanStages(explain, "$graphLookup")[0].coveredWalks, tojson(explain));
+
+    // The $project is rewritten to read the packed 'desc' values only for execution. The
+    // serialized pipeline must keep the user's '$desc.node_id' expression, so replaying the
+    // explain output returns the same ids rather than the descendant documents.
+    const explained = tree.explain().aggregate(pipeline(tree));
+    const explainedProject = getAggPlanStages(explained, "$project")[0].$project;
+    assert.eq("$desc.node_id", explainedProject.ids, tojson(explainedProject));
+    const explainedGraphLookup = getAggPlanStages(explained, "$graphLookup")[0].$graphLookup;
+    const [replayed] = tree
+        .aggregate([
+            {$match: {_id: 0}},
+            {$graphLookup: explainedGraphLookup},
+            {$project: explainedProject},
+        ])
+        .toArray();
+    assert.eq(["n1", "n2", "n3"], replayed.ids.slice().sort(), tojson(replayed));
 
     const reordered = makeColl(
         db,
@@ -259,6 +277,76 @@ function run(coll, profileDB, pipeline, options = {}) {
         () => tree.aggregate(pipeline(tree), {allowDiskUse: false}).toArray(),
         ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed,
     );
+
+    MongoRunner.stopMongod(conn);
+}
+
+// Yielding: the walk abandons its snapshot and yields its acquisition periodically like a
+// PlanExecutor, instead of holding both for the whole traversal. Dropping the very index it
+// is scanning while it is yielded must proceed and must not corrupt the result: the walk
+// gives up and the subpipeline search answers against the new catalog.
+{
+    const conn = MongoRunner.runMongod({setParameter: {[kGate]: true}});
+    const db = conn.getDB("test");
+
+    // The input document lives in its own collection, so a yield hang scoped to the
+    // 'from' namespace can only come from the covered walk, not the input executor.
+    const roots = db.roots;
+    assert.commandWorked(roots.insert({_id: 0, node_id: "root"}));
+    // More than the 128 keys between yield checks, all under one parent.
+    const kChildren = 300;
+    const docs = Array.from({length: kChildren}, (_, i) => ({
+        _id: i + 1,
+        tree_id: "t0",
+        node_id: "c" + i,
+        parent_id: "root",
+    }));
+    const kWalkIndex = {tree_id: 1, parent_id: 1, node_id: 1};
+    const wide = makeColl(db, "wide", docs, kWalkIndex);
+    const yieldPipeline = [
+        {$match: {_id: 0}},
+        {
+            $graphLookup: {
+                from: wide.getName(),
+                startWith: "$node_id",
+                connectFromField: "node_id",
+                connectToField: "parent_id",
+                restrictSearchWithMatch: {tree_id: "t0"},
+                maxDepth: 0,
+                as: "desc",
+            },
+        },
+        {$project: {_id: 0, ids: "$desc.node_id"}},
+    ];
+
+    assert.commandWorked(db.adminCommand({setParameter: 1, internalQueryExecYieldIterations: 1}));
+    const fp = configureFailPoint(db, "setYieldAllLocksHang", {namespace: wide.getFullName()});
+    try {
+        const awaitShell = startParallelShell(
+            funWithArgs(
+                function (dbName, pipeline, nChildren) {
+                    const [out] = db.getSiblingDB(dbName).roots.aggregate(pipeline).toArray();
+                    assert.eq(nChildren, out.ids.length, tojson(out.ids));
+                    assert.sameMembers(
+                        Array.from({length: nChildren}, (_, i) => "c" + i),
+                        out.ids,
+                    );
+                },
+                db.getName(),
+                yieldPipeline,
+                kChildren,
+            ),
+            conn.port,
+        );
+
+        fp.wait();
+        // The walk is yielded: dropping the index it is scanning proceeds.
+        assert.commandWorked(wide.dropIndex(kWalkIndex));
+        fp.off();
+        awaitShell();
+    } finally {
+        fp.off();
+    }
 
     MongoRunner.stopMongod(conn);
 }

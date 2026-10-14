@@ -340,6 +340,13 @@ void ProjectionNode::optimize() {
 void ProjectionNode::substituteFieldPathsInExpressions(const StringMap<std::string>& renames) {
     SubstituteFieldPathWalker walker(renames);
     for (auto&& expressionPair : _expressions) {
+        // The walker mutates the expression tree in place, so clone before walking. Only the
+        // first substitution is recorded: serialize() must emit the user's original pipeline no
+        // matter how many execution-only rewrites were applied on top of it.
+        if (!_expressionsBeforeSubstitution.contains(expressionPair.first)) {
+            _expressionsBeforeSubstitution[expressionPair.first] =
+                expressionPair.second->clone(*expressionPair.second->getExpressionContext());
+        }
         if (auto substituted =
                 expression_walker::walk<Expression>(expressionPair.second.get(), &walker)) {
             expressionPair.second = substituted.release();
@@ -387,15 +394,23 @@ void ProjectionNode::serialize(MutableDocument* output,
                     "reached end of the expression iterator",
                     expressionIt != _expressions.end());
 
-            auto isExpressionObject = dynamic_cast<ExpressionObject*>(expressionIt->second.get());
+            // Emit the user's original expression when an execution-only substitution rewrote
+            // the live one, so the serialized pipeline remains equivalent to the input.
+            const auto* expressionToSerialize = expressionIt->second.get();
+            if (auto originalIt = _expressionsBeforeSubstitution.find(field);
+                originalIt != _expressionsBeforeSubstitution.end()) {
+                expressionToSerialize = originalIt->second.get();
+            }
+
+            auto isExpressionObject = dynamic_cast<const ExpressionObject*>(expressionToSerialize);
 
             if (isExpressionObject) {
                 output->addField(
                     options.serializeFieldPathFromString(field),
-                    Value(Document{{"$expr", expressionIt->second->serialize(options)}}));
+                    Value(Document{{"$expr", expressionToSerialize->serialize(options)}}));
             } else {
                 output->addField(options.serializeFieldPathFromString(field),
-                                 expressionIt->second->serialize(options));
+                                 expressionToSerialize->serialize(options));
             }
         }
     }

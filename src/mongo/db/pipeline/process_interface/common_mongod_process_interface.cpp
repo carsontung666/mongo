@@ -43,11 +43,13 @@
 #include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_cache/plan_cache.h"
 #include "mongo/db/query/plan_cache/sbe_plan_cache.h"
+#include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_integration_knobs_gen.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/yield_policy_callbacks_impl.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/query_analysis_writer.h"
 #include "mongo/db/s/transaction_coordinator_curop.h"
@@ -114,6 +116,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <string_view>
 #include <vector>
@@ -1528,6 +1531,57 @@ const IndexCatalogEntry* findEqualityPrefixIndex(OperationContext* opCtx,
     return nullptr;
 }
 
+// Periodically yields like a PlanExecutor while the covered walk scans: saves the one index
+// cursor, lets PlanYieldPolicy abandon the snapshot and yield the operation's acquisitions,
+// then restores the cursor. Multi-document transactions are downgraded to INTERRUPT_ONLY by
+// the base class, in which case the cursor is never saved and the snapshot is retained.
+//
+// Callers only yield at points where the current key has been fully processed: after a
+// restore, next() returns the key after the saved position. The collection or index may be
+// dropped while yielded, so the caller re-validates it in 'stillValid' before the cursor is
+// restored; if it is gone, 'invalidated()' is set and the walk must be abandoned (the caller
+// falls back to the subpipeline search, which observes the new catalog state).
+class CoveredWalkYieldPolicy final : public PlanYieldPolicy {
+public:
+    CoveredWalkYieldPolicy(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           SortedDataInterface::Cursor* cursor,
+                           RecoveryUnit& ru,
+                           std::function<bool()> stillValid)
+        : PlanYieldPolicy(opCtx,
+                          YieldPolicy::YIELD_AUTO,
+                          &opCtx->fastClockSource(),
+                          internalQueryExecYieldIterations.load(),
+                          Milliseconds{internalQueryExecYieldPeriodMS.load()},
+                          std::make_unique<YieldPolicyCallbacksImpl>(nss)),
+          _cursor(cursor),
+          _ru(ru),
+          _stillValid(std::move(stillValid)) {}
+
+    bool invalidated() const {
+        return _invalidated;
+    }
+
+private:
+    void saveState(OperationContext* opCtx) override {
+        _cursor->save();
+    }
+
+    void restoreState(OperationContext* opCtx,
+                      const Yieldable* yieldable,
+                      RestoreContext::RestoreType restoreType) override {
+        _invalidated = !_stillValid();
+        if (!_invalidated) {
+            _cursor->restore(_ru);
+        }
+    }
+
+    SortedDataInterface::Cursor* const _cursor;
+    RecoveryUnit& _ru;
+    const std::function<bool()> _stillValid;
+    bool _invalidated = false;
+};
+
 }  // namespace
 
 boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCoveredWalk(
@@ -1561,6 +1615,7 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
                 return boost::none;
             }
             const auto& coll = acquisition.getCollectionPtr();
+            const auto collectionUuid = coll->uuid();
             // The subpipeline unpacks timeseries buckets, and dedupes documents by a unique _id.
             if (coll->isTimeseriesCollection() ||
                 !(coll->isClustered() || coll->getIndexCatalog()->findIdIndex(opCtx))) {
@@ -1650,23 +1705,66 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
             };
 
             auto cursor = iam->newCursor(opCtx, ru, true /* forward */);
+            // As in a PlanExecutor, periodically abandon the snapshot and yield the
+            // acquisition instead of holding both for the whole traversal. If the collection
+            // or the very index the cursor was opened on disappears while yielded, the walk
+            // gives up and the caller runs the subpipeline search against the new catalog.
+            CoveredWalkYieldPolicy yieldPolicy(opCtx, from, cursor.get(), ru, [&] {
+                if (!acquisition.exists()) {
+                    return false;
+                }
+                const auto& nowColl = acquisition.getCollectionPtr();
+                return nowColl && nowColl->uuid() == collectionUuid &&
+                    findEqualityPrefixIndex(opCtx,
+                                            nowColl,
+                                            equalities,
+                                            connectToField,
+                                            connectFromField,
+                                            outputField) == indexEntry;
+            });
+            // Yields if the policy says it is due; false if the index went away while yielded.
+            // 'view' is unowned cursor data and is invalidated by a yield, so callers must
+            // only call this when the current key has been fully processed, and must not read
+            // 'view' after a false return.
+            auto maybeYield = [&]() -> bool {
+                if (!yieldPolicy.shouldYieldOrInterrupt(opCtx)) {
+                    return true;
+                }
+                uassertStatusOK(yieldPolicy.yieldOrInterrupt(
+                    opCtx, nullptr /* whileYieldingFn */, RestoreContext::RestoreType::kYield));
+                return !yieldPolicy.invalidated();
+            };
+
             key_string::Builder seekBuilder(version);
             size_t keysExamined = 0;
             ON_BLOCK_EXIT([&] { stats->totalKeysExamined += keysExamined; });
             SortedDataKeyValueView view;
-            auto seek = [&](std::span<const char> keyPrefix) {
+            size_t seeksSinceYieldCheck = 0;
+            auto seek = [&](std::span<const char> keyPrefix) -> bool {
                 opCtx->checkForInterrupt();
+                // Seeking repositions the cursor anyway, so it is safe to yield first.
+                if (++seeksSinceYieldCheck % 128 == 0 && !maybeYield()) {
+                    return false;
+                }
                 seekBuilder.resetToEmpty(key_string::ALL_ASCENDING,
                                          key_string::Discriminator::kExclusiveBefore);
                 seekBuilder.appendBytes(keyPrefix.data(), keyPrefix.size());
                 view = cursor->seekForKeyValueView(ru, seekBuilder.finishAndGetBuffer());
                 keysExamined += !view.isEmpty();
+                return true;
             };
-            auto advance = [&] {
-                view = cursor->nextKeyValueView(ru);
-                if (!view.isEmpty() && ++keysExamined % 128 == 0) {
+            auto advance = [&]() -> bool {
+                // The key in 'view' has been fully processed when this is called, so the
+                // cursor may yield here: after the restore, next() returns the following key.
+                if (keysExamined > 0 && keysExamined % 128 == 0) {
                     opCtx->checkForInterrupt();
+                    if (!maybeYield()) {
+                        return false;
+                    }
                 }
+                view = cursor->nextKeyValueView(ru);
+                keysExamined += !view.isEmpty();
+                return true;
             };
             // Keys sort by their bytes, but one string's encoding can be a byte prefix of
             // another's: "a" is 3C 61 00 and "a\0x" is 3C 61 00 FF 78 00, as a NUL is escaped as
@@ -1786,23 +1884,30 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
                 for (const auto& keyPrefixView : frontier) {
                     const std::span<const char> keyPrefix(keyPrefixView);
                     if (!positioned) {
-                        seek(keyPrefix);
+                        if (!seek(keyPrefix)) {
+                            return boost::none;
+                        }
                         positioned = true;
                     } else {
                         for (int steps = 0; !view.isEmpty() && compareToPrefix(keyPrefix) < 0;
                              ++steps) {
                             if (steps == kStepsBeforeSeek) {
-                                seek(keyPrefix);
+                                if (!seek(keyPrefix)) {
+                                    return boost::none;
+                                }
                                 break;
                             }
-                            advance();
+                            if (!advance()) {
+                                return boost::none;
+                            }
                         }
                     }
                     if (view.isEmpty()) {
                         // The rest of the frontier sorts after the last key.
                         break;
                     }
-                    for (; !view.isEmpty() && compareToPrefix(keyPrefix) == 0; advance()) {
+                    while (!view.isEmpty() && compareToPrefix(keyPrefix) == 0) {
+                        bool handledFast = false;
                         if (fastLayout && view.getTypeBitsView().empty()) {
                             const auto key = view.getKeyStringWithoutRecordIdView();
                             const char* begin = key.data() + keyPrefix.size();
@@ -1817,30 +1922,35 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
                                 if (memoryBytes > maxMemoryBytes) {
                                     return boost::none;
                                 }
-                                continue;
+                                handledFast = true;
                             }
                         }
-                        decode();
-                        Value out(keyFields[outPos]);
-                        // A null key may be a missing field, which '$as.field' skips.
-                        if (out.nullish()) {
-                            return boost::none;
-                        }
-                        memoryBytes += sizeof(Value) + out.getApproximateSize();
-                        if (expand) {
-                            const auto& from = keyFields[fromPos];
-                            if (from.type() == BSONType::null) {
-                                nullOnFrontier = true;
-                            } else if (!seekMatchesInQuery(from.type())) {
+                        if (!handledFast) {
+                            decode();
+                            Value out(keyFields[outPos]);
+                            // A null key may be a missing field, which '$as.field' skips.
+                            if (out.nullish()) {
                                 return boost::none;
-                            } else {
-                                enqueue(from, &next);
                             }
+                            memoryBytes += sizeof(Value) + out.getApproximateSize();
+                            if (expand) {
+                                const auto& from = keyFields[fromPos];
+                                if (from.type() == BSONType::null) {
+                                    nullOnFrontier = true;
+                                } else if (!seekMatchesInQuery(from.type())) {
+                                    return boost::none;
+                                } else {
+                                    enqueue(from, &next);
+                                }
+                            }
+                            if (memoryBytes > maxMemoryBytes) {
+                                return boost::none;
+                            }
+                            results.push_back(std::move(out));
                         }
-                        if (memoryBytes > maxMemoryBytes) {
+                        if (!advance()) {
                             return boost::none;
                         }
-                        results.push_back(std::move(out));
                     }
                 }
                 lastFrontierSize = frontier.size();
@@ -1852,7 +1962,9 @@ boost::optional<std::vector<Value>> CommonMongodProcessInterface::graphLookupCov
             // nothing only if no document has a null connectTo.
             if (nullOnFrontier) {
                 const auto keyPrefix = encodePrefix(BSON("" << BSONNULL).firstElement());
-                seek(keyPrefix);
+                if (!seek(keyPrefix)) {
+                    return boost::none;
+                }
                 if (!view.isEmpty() && compareToPrefix(keyPrefix) == 0) {
                     return boost::none;
                 }
